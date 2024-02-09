@@ -1,6 +1,6 @@
 # WSCls
 
-Simple websocket terminal client
+Simple terminal based websocket terminal client
 
 ![Demo](/data/demo.svg)
 
