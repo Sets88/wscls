@@ -1,0 +1,1 @@
+from .wscls import main
