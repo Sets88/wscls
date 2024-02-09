@@ -2,7 +2,7 @@
 
 Simple websocket terminal client
 
-![Demo](/data/demp.svg)
+![Demo](/data/demo.svg)
 
 
 ## Installation
