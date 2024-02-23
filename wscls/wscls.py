@@ -19,12 +19,14 @@ from textual.widgets import TabbedContent
 from textual.widgets import TabPane
 from textual.widgets import Switch
 from textual.widget import Widget
+from textual.widgets import Footer
 from textual.containers import Horizontal
+from textual.containers import Vertical
 from textual.widgets.option_list import Option
 from textual.events import Event
 from textual.message import Message
 from textual.containers import Grid
-from textual.screen import Screen
+from textual.screen import ModalScreen
 from textual import on
 from textual import work
 
@@ -47,7 +49,7 @@ class MainGrid(Grid):
         width: 1fr;
         height: 1fr;
         layout: grid;
-        grid-rows: 3 60% 15%
+        grid-rows: 3 1 60% 15%
     }
     """
 
@@ -143,7 +145,27 @@ class State:
             json.dump(state_data, fil)
 
 
-class AddHeaderScreen(Screen):
+class AddHeaderScreen(ModalScreen):
+    CSS = """
+        AddHeaderScreen {
+            align: center middle;
+        }
+        AddHeaderScreen > Vertical {
+            background: #101030;
+            border: tall #303040;
+            height: 12;
+            width: 70;
+        }
+        AddHeaderScreen #content {
+            margin: 0 1;
+        }
+        AddHeaderScreen Label {
+            margin: 0 1;
+        }
+        AddHeaderScreen #buttons {
+            margin: 0 1;
+        }
+    """
     @on(Button.Pressed, '#add')
     def add(self, message: Message):
         self.dismiss((self.query_one('#header_name').value, self.query_one('#header_value').value))
@@ -161,13 +183,16 @@ class AddHeaderScreen(Screen):
             self.dismiss(None)
 
     def compose(self) -> ComposeResult:
-        yield Label('Add Header')
-        yield Input(placeholder='Name', id='header_name')
-        yield Input(placeholder='Value', id='header_value')
-        yield Horizontal(
-            Button('Add', id='add'),
-            Button('Cancel', id='cancel')
-        )
+        with Vertical():
+            with Vertical(id='content'):
+                yield Label('Add Header')
+                yield Input(placeholder='Name', id='header_name')
+                yield Input(placeholder='Value', id='header_value')
+                yield Horizontal(
+                    Button('Add', id='add'),
+                    Button('Cancel', id='cancel'),
+                    id='buttons'
+                )
 
 
 class AddressInput(Input):
@@ -210,13 +235,16 @@ class WsApp(App):
         else:
             log.write(f'[cyan]Received: {msg.data}')
 
-    def on_connected(self, log: RichLog):
-        log.write(f'[green]Connected to: {self.state.get_value("url")}')
+    def on_connected(self, log: RichLog, url: str):
+        text = f'[green]Connected to: {self.state.get_value("url")}'
+        log.write(text)
+        self.set_status_text(text)
         log.styles.border = ('heavy', 'green')
-        self.query_one(SendTextArea)
 
     def on_disconnected(self, log: RichLog):
-        log.write('[red]Disconnected')
+        text = '[red]Disconnected'
+        self.set_status_text(text)
+        log.write(text)
         log.styles.border = ('heavy', 'red')
 
     async def connect(self):
@@ -225,16 +253,17 @@ class WsApp(App):
             try:
                 async with aiohttp.ClientSession() as session:
                     ssl_check = None if self.state.get_value('ssl_check') else False
+                    url = self.state.get_value('url')
 
                     async with session.ws_connect(
-                        self.state.get_value('url'),
+                        url,
                         headers=self.state.get_value('headers'),
                         autoping=self.state.get_value('autoping'),
                         ssl=ssl_check
                     ) as ws:
                         try:
                             self._ws = ws
-                            self.on_connected(log)
+                            self.on_connected(log, url)
                             async for msg in ws:
                                 await self.process_incomming_ws_message(log, msg)
 
@@ -275,9 +304,7 @@ class WsApp(App):
     @work
     async def on_add_header_menu_button_message(self, message: Message):
         screen = AddHeaderScreen()
-        screen.styles.width = 40
-        screen.styles.height = 10
-        screen.styles.border = ('heavy', 'white')
+
         data = await self.push_screen_wait(
             screen
         )
@@ -404,6 +431,7 @@ class WsApp(App):
                 AddressInput(self.state.get_value('url'), placeholder='URL', id='address'),
                 Button('Connect', id='connect')
             ),
+            Label('Disconnected', id='status'),
             RichLog(highlight=True, markup=True, id='ws_sessions_log'),
             SendTextArea(self.state.get_value('text')),
             HorizontalHAuto(
@@ -443,6 +471,9 @@ class WsApp(App):
             Button('Add config', id='add_configuration')
         )
 
+    def set_status_text(self, text: str):
+        self.query_one('#status').update(text)
+
     def compose(self) -> ComposeResult:
         with TabbedContent(initial='Request'):
             with TabPane('Request', id='Request'):
@@ -450,6 +481,7 @@ class WsApp(App):
 
             with TabPane('Options', id='Options'):
                 yield from self.compse_options_tab()
+        yield Footer()
 
 
 def main():
