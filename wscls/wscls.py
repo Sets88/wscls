@@ -2,12 +2,16 @@ import argparse
 import os
 import asyncio
 import json
+import shutil
 from time import time
 from typing import Any
+import tempfile
 
 import aiohttp
 from aiohttp.http_websocket import WSMessage
 from textual.app import App, ComposeResult
+from textual.app import Binding
+from textual.reactive import reactive
 from textual.widgets import TextArea
 from textual.widgets import Input
 from textual.widgets import RichLog
@@ -49,7 +53,7 @@ class MainGrid(Grid):
         width: 1fr;
         height: 1fr;
         layout: grid;
-        grid-rows: 3 1 60% 15%
+        grid-rows: 4 1 5fr 1fr 30%
     }
     """
 
@@ -64,6 +68,7 @@ class ConnectContainer(Widget):
         grid-size-columns: 2;
     }
     """
+
 
 class HorizontalHAuto(Widget):
     DEFAULT_CSS = """
@@ -85,6 +90,7 @@ class State:
         self.configurations = {
             'default': self.default_configuration
         }
+        self.loaded = False
 
     @property
     def default_configuration(self):
@@ -92,7 +98,7 @@ class State:
             'url': '',
             'headers': {},
             'autoping': False,
-            'text': '',
+            'texs': {'': ''},
             'auto_reconnect': True,
             'ssl_check': True
         }
@@ -104,8 +110,8 @@ class State:
             self.configuration_name = list(self.configurations.keys())[0]
             return self.configurations[self.configuration_name]
 
-    def get_value(self, key):
-        return self.get_configuration().get(key)
+    def get_value(self, key, default=None):
+        return self.get_configuration().get(key, default)
 
     def set_value(self, key: str, value: Any):
         self.get_configuration()[key] = value
@@ -132,6 +138,7 @@ class State:
                 state_file = json.load(fil)
                 self.configurations = state_file.get('configurations', self.configurations)
                 self.configuration_name = state_file.get('selected_configuration', 'default')
+                self.loaded = True
         except Exception as exc:
             print(exc)
 
@@ -141,33 +148,132 @@ class State:
             'selected_configuration': self.configuration_name
         }
 
-        with open(self.state_filename, 'w', encoding='utf8') as fil:
-            json.dump(state_data, fil)
+        if self.loaded:
+            with tempfile.NamedTemporaryFile(mode="w", buffering=1) as fil:
+                fil.write(json.dumps(state_data))
+                fil.flush()
+                shutil.copy(fil.name, self.state_filename)
 
 
-class AddHeaderScreen(ModalScreen):
+class WsRichLog(RichLog):
+    BINDINGS = [
+        Binding('s', 'toggle_scroll'),
+        Binding('c', 'clear'),
+        Binding('w', 'toggle_wrap'),
+    ]
+
+    def action_toggle_wrap(self):
+        self.wrap = not self.wrap
+        self.app.query_one('#log_status').word_wrap = self.wrap
+
+    def action_clear(self):
+        self.lines.clear()
+        self.refresh()
+
+    def action_toggle_scroll(self):
+        self.auto_scroll = not self.auto_scroll
+        self.refresh()
+        self.app.query_one('#log_status').auto_scroll = self.auto_scroll
+
+
+class EditModalScreen(ModalScreen):
     CSS = """
-        AddHeaderScreen {
+        EditModalScreen {
             align: center middle;
         }
-        AddHeaderScreen > Vertical {
+        EditModalScreen > Vertical {
             background: #101030;
             border: tall #303040;
             height: 12;
             width: 70;
         }
-        AddHeaderScreen #content {
+        EditModalScreen #content {
             margin: 0 1;
         }
-        AddHeaderScreen Label {
+        EditModalScreen Label {
             margin: 0 1;
         }
-        AddHeaderScreen #buttons {
+        EditModalScreen #buttons {
             margin: 0 1;
         }
     """
+    def __init__(self, title, name=None) -> None:
+        self.key_name = name
+        self.modal_title = title
+        super().__init__()
+
     @on(Button.Pressed, '#add')
     def add(self, message: Message):
+        self.dismiss(self.query_one('#text_name').value)
+
+    @on(Button.Pressed, '#save')
+    def save(self, message: Message):
+        self.dismiss(self.query_one('#text_name').value)
+
+    @on(Button.Pressed, '#cancel')
+    def cancel(self, message: Message):
+        self.dismiss(None)
+
+    @on(Input.Submitted)
+    def submit(self, message: Message):
+        self.dismiss(self.query_one('#text_name').value)
+
+    def on_key(self, event: Event):
+        if event.key == 'escape':
+            self.dismiss(None)
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            with Vertical(id='content'):
+                yield Label(self.modal_title)
+                yield Input(placeholder='Name', id='text_name', value=self.key_name)
+
+                if self.key_name:
+                    yield Horizontal(
+                        Button('Save', id='save'),
+                        Button('Cancel', id='cancel'),
+                        id='buttons'
+                    )
+                else:
+                    yield Horizontal(
+                        Button('Add', id='add'),
+                        Button('Cancel', id='cancel'),
+                        id='buttons'
+                    )
+
+
+class EditHeaderScreen(ModalScreen):
+    CSS = """
+        EditHeaderScreen {
+            align: center middle;
+        }
+        EditHeaderScreen > Vertical {
+            background: #101030;
+            border: tall #303040;
+            height: 12;
+            width: 70;
+        }
+        EditHeaderScreen #content {
+            margin: 0 1;
+        }
+        EditHeaderScreen Label {
+            margin: 0 1;
+        }
+        EditHeaderScreen #buttons {
+            margin: 0 1;
+        }
+    """
+    def __init__(self, name=None, value=None) -> None:
+        self.key_name = name
+        self.value = value
+        super().__init__()
+
+    @on(Button.Pressed, '#add')
+    def add(self, message: Message):
+        self.dismiss((self.query_one('#header_name').value, self.query_one('#header_value').value))
+
+    @on(Button.Pressed, '#save')
+    def save(self, message: Message):
         self.dismiss((self.query_one('#header_name').value, self.query_one('#header_value').value))
 
     @on(Button.Pressed, '#cancel')
@@ -185,35 +291,55 @@ class AddHeaderScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         with Vertical():
             with Vertical(id='content'):
-                yield Label('Add Header')
-                yield Input(placeholder='Name', id='header_name')
-                yield Input(placeholder='Value', id='header_value')
-                yield Horizontal(
-                    Button('Add', id='add'),
-                    Button('Cancel', id='cancel'),
-                    id='buttons'
-                )
+                if self.key_name:
+                    yield Label('Edit Header')
+                else:
+                    yield Label('Add Header')
+                yield Input(placeholder='Name', id='header_name', value=self.key_name)
+                yield Input(placeholder='Value', id='header_value', value=self.value)
+
+                if self.key_name:
+                    yield Horizontal(
+                        Button('Save', id='save'),
+                        Button('Cancel', id='cancel'),
+                        id='buttons'
+                    )
+                else:
+                    yield Horizontal(
+                        Button('Add', id='add'),
+                        Button('Cancel', id='cancel'),
+                        id='buttons'
+                    )
 
 
 class AddressInput(Input):
     pass
 
 
-class AddHeaderMenuButton(Button):
-    class Message(Message):
-        pass
+class LogStatus(Label):
+    DEFAULT_CSS = """
+    LogStatus {
+        dock: right;
+    }
+    """
+    word_wrap = reactive(False)
+    auto_scroll = reactive(True)
 
-    def on_button_pressed(self, event: Event):
-        self.post_message(self.Message())
+    def render(self):
+        return (f" Word wrapping: [cyan]w[/cyan] ({'On' if self.word_wrap else 'Off'}) Clear: "
+            f"[cyan]c[/cyan] Scroll: [cyan]s[/cyan] ({'On' if self.auto_scroll else 'Off'})")
 
 
 class SendTextArea(TextArea):
+    BINDINGS = [
+        Binding('ctrl+r', 'send_message'),
+        Binding('ctrl+f', 'send_message')
+    ]
     def on_text_area_changed(self, event: Event):
-        self.app.state.set_value('text', self.text)
+        self.app.state.get_value('texts', {})[self.app.state.get_value('text_selected')] = self.text
 
-    def on_key(self, event: Event):
-        if event.key == 'ctrl+r':
-            self.parent.query_one('#send_message').action_press()
+    async def action_send_message(self):
+        self.app.query_one('#send_message').action_press()
 
 
 class WsApp(App):
@@ -288,6 +414,12 @@ class WsApp(App):
             [Option(f'{k}: {v}', id=k) for k, v in self.state.get_value('headers').items()]
         )
 
+    def refresh_texts(self):
+        text_list = self.query_one('#texts')
+        values = [(x, x) for x in self.state.get_value('texts', {'': ''}).keys()]
+        text_list.set_options(values)
+        text_list.value = self.state.get_value('text_selected', values[0][0])
+
     def refresh_configurations(self):
         config_list = self.query_one('#configurations_list')
         config_list.set_options([(x, x) for x in self.state.configurations.keys()])
@@ -295,15 +427,18 @@ class WsApp(App):
 
     def refresh_fields(self):
         self.query_one(AddressInput).value = self.state.get_value('url')
-        self.query_one(SendTextArea).text = self.state.get_value('text')
+        self.query_one(SendTextArea).text = (
+            self.state.get_value('texts', {'': ''}).get(self.state.get_value('text_selected'), '')
+        )
         self.query_one('#autoping').value = self.state.get_value('autoping')
         self.query_one('#auto_reconnect').value = self.state.get_value('auto_reconnect')
         self.query_one('#ssl_check').value = self.state.get_value('ssl_check')
         self.refresh_headers()
 
     @work
+    @on(Button.Pressed, '#add_header')
     async def on_add_header_menu_button_message(self, message: Message):
-        screen = AddHeaderScreen()
+        screen = EditHeaderScreen()
 
         data = await self.push_screen_wait(
             screen
@@ -316,9 +451,86 @@ class WsApp(App):
 
         self.refresh_headers()
 
+    @work
+    @on(Button.Pressed, '#edit_header')
+    async def on_edit_header_menu_button_message(self, message: Message):
+        headers_list = self.query_one('#headers_list')
+
+        if headers_list.highlighted is None:
+            return
+
+        selected = headers_list.get_option_at_index(headers_list.highlighted)
+
+        if not selected.id:
+            return
+
+        screen = EditHeaderScreen(name=selected.id, value=self.state.get_value('headers')[selected.id])
+
+        data = await self.push_screen_wait(
+            screen
+        )
+
+        if not data:
+            return
+
+        self.state.get_value('headers').pop(selected.id)
+        self.state.get_value('headers')[data[0]] = data[1]
+
+        self.refresh_headers()
+
+    @work
+    @on(Button.Pressed, '#add_text')
+    async def on_add_text_select_item(self, message: Message):
+        screen = EditModalScreen('Add Text')
+
+        data = await self.push_screen_wait(
+            screen
+        )
+
+        if not data:
+            return
+
+        if self.state.get_value('texts') and data in self.state.get_value('texts'):
+            # Exists
+            return
+
+        if not self.state.get_value('texts'):
+            self.state.set_value('texts', {})
+
+        self.state.get_value('texts')[data] = ''
+        self.refresh_texts()
+
+    @work
+    @on(Button.Pressed, '#edit_text')
+    async def on_edit_edit_text_select_item(self, message: Message):
+        config_list = self.query_one('#texts')
+        selected = config_list.value
+
+        if selected is None:
+            return
+
+        screen = EditModalScreen('Edit text', name=selected)
+
+        data = await self.push_screen_wait(
+            screen
+        )
+
+        if not data:
+            return
+
+        if self.state.get_value('texts') and data in self.state.get_value('texts'):
+            # Exists
+            return
+
+        self.state.get_value('texts')[data] = self.state.get_value('texts').pop(selected)
+        self.state.set_value('text_selected', data)
+
+        self.refresh_texts()
+
     def on_mount(self):
         self.refresh_fields()
         self.refresh_configurations()
+        self.refresh_texts()
 
     @on(Button.Pressed, '#connect')
     async def on_connect_button_message(self, message: Message):
@@ -375,6 +587,19 @@ class WsApp(App):
             del self.state.get_value('headers')[selected.id]
             self.refresh_headers()
 
+    @on(Button.Pressed, '#delete_text')
+    def delete_text(self, message: Message):
+        texts_list = self.query_one('#texts')
+
+        selected = texts_list.value
+
+        if selected is None:
+            return
+
+        self.state.get_value('texts').pop(selected.id)
+
+        self.refresh_texts()
+
     @on(AddressInput.Submitted)
     def submit_connect(self, message: Message):
         self.query_one('#connect').action_press()
@@ -389,13 +614,24 @@ class WsApp(App):
             except Exception as exc:
                 log.write(f'[red]Error: {exc}')
 
+    @work
     @on(Button.Pressed, '#add_configuration')
-    def add_configuration(self, message: Message):
-        name_field = self.query_one('#configuration_name')
-        if name_field.value:
-            self.state.add_configuration(name_field.value)
-            self.refresh_configurations()
-            name_field.clear()
+    async def on_add_configuration(self, message: Message):
+        screen = EditModalScreen('Add Configuration')
+
+        data = await self.push_screen_wait(
+            screen
+        )
+
+        if not data:
+            return
+
+        if self.state.get_value('configurations') and data in self.state.get_value('configurations'):
+            # Exists
+            return
+
+        self.state.add_configuration(data)
+        self.refresh_configurations()
 
     @on(Button.Pressed, '#delete_configuration')
     def delete_configuration(self, message: Message):
@@ -403,6 +639,8 @@ class WsApp(App):
         selected = config_list.value
         if selected:
             self.state.delete_configuration(selected)
+            self.state.configuration_name = list(self.state.configurations.keys())[0]
+            self.refresh_fields()
             self.refresh_configurations()
 
     @on(Switch.Changed, '#autoping')
@@ -424,6 +662,16 @@ class WsApp(App):
         if selected:
             self.state.configuration_name = selected
             self.refresh_fields()
+            self.refresh_texts()
+
+    @on(Select.Changed, '#texts')
+    def change_texts(self, message: Message):
+        selected = message.value
+
+        if selected and selected != Select.BLANK:
+            self.state.set_value('text_selected', selected)
+            self.state.set_value('text', self.state.get_value('texts')[selected])
+            self.refresh_fields()
 
     def compose_request_tab(self):
         yield MainGrid(
@@ -431,9 +679,18 @@ class WsApp(App):
                 AddressInput(self.state.get_value('url'), placeholder='URL', id='address'),
                 Button('Connect', id='connect')
             ),
-            Label('Disconnected', id='status'),
-            RichLog(highlight=True, markup=True, id='ws_sessions_log'),
-            SendTextArea(self.state.get_value('text')),
+            Horizontal(
+                Label('Disconnected', id='status'),
+                LogStatus('', id='log_status'),
+            ),
+            WsRichLog(highlight=True, markup=True, id='ws_sessions_log'),
+            HorizontalHAuto(
+                Select([('', '')], id='texts'),
+                Button('Add', id='add_text'),
+                Button('Delete', id='delete_text'),
+                Button('Edit', id='edit_text')
+            ),
+            SendTextArea(''),
             HorizontalHAuto(
                 Button('Send', id='send_message'),
                 Button('Ping', id='ping')
@@ -441,34 +698,33 @@ class WsApp(App):
         )
 
     def compse_options_tab(self):
-        yield Label('Headers')
-        yield OptionList(id='headers_list')
-        yield HorizontalHAuto(
-            AddHeaderMenuButton('Add'),
-            Button('Delete', id='delete_header')
-        )
-        yield HorizontalHAuto(
-            Label('\nAuto ping:'),
-            Switch(self.state.get_value('autoping'), animate=True, id='autoping')
-        )
-        yield HorizontalHAuto(
-            Label('\nAuto reconnect:'),
-            Switch(self.state.get_value('auto_reconnect'), animate=True, id='auto_reconnect')
-        )
-        yield HorizontalHAuto(
-            Label('\nCheck SSL:'),
-            Switch(self.state.get_value('ssl_check'), animate=True, id='ssl_check')
-        )
-        yield Label('Configurations')
-
-        yield HorizontalHAuto(
-            Select([('', '')], id='configurations_list'),
-            Button('Delete', id='delete_configuration')
-        )
-
-        yield ConfigurationAddGrid(
-            Input(placeholder='Name', id='configuration_name'),
-            Button('Add config', id='add_configuration')
+        yield Vertical(
+            Label('Headers'),
+            HorizontalHAuto(
+                OptionList(id='headers_list'),
+                Button('Add', id='add_header'),
+                Button('Delete', id='delete_header'),
+                Button('Edit', id='edit_header'),
+            ),
+            HorizontalHAuto(
+                Label('\nAuto ping:'),
+                Switch(self.state.get_value('autoping'), animate=True, id='autoping')
+            ),
+            HorizontalHAuto(
+                Label('\nAuto reconnect:'),
+                Switch(self.state.get_value('auto_reconnect'), animate=True, id='auto_reconnect')
+            ),
+            HorizontalHAuto(
+                Label('\nCheck SSL:'),
+                Switch(self.state.get_value('ssl_check'), animate=True, id='ssl_check')
+            ),
+            Label('Configurations'),
+            HorizontalHAuto(
+                Select([('', '')], id='configurations_list'),
+                Button('Add', id='add_configuration'),
+                Button('Delete', id='delete_configuration'),
+                Button('Edit', id='edit_configuration'),
+            )
         )
 
     def set_status_text(self, text: str):
