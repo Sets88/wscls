@@ -1,2 +1,2 @@
-textual==0.50.0
+textual==0.82.0
 aiohttp==3.9.3
