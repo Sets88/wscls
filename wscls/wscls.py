@@ -132,6 +132,7 @@ class State:
 
     def load(self):
         if not os.path.exists(self.state_filename):
+            self.loaded = True
             return
         try:
             with open(self.state_filename, 'r', encoding='utf8') as fil:
@@ -147,7 +148,6 @@ class State:
             'configurations': self.configurations,
             'selected_configuration': self.configuration_name
         }
-
         if self.loaded:
             with tempfile.NamedTemporaryFile(mode="w", buffering=1) as fil:
                 fil.write(json.dumps(state_data))
@@ -347,7 +347,7 @@ class WsApp(App):
         super().__init__()
         self._connect_task = None
         self._ws = None
-        self._connecting = None
+        self._connecting_params = None
         self.state = state
 
     async def process_incomming_ws_message(self, log: RichLog, msg: WSMessage):
@@ -376,15 +376,19 @@ class WsApp(App):
     async def connect(self):
         log = self.query_one('#ws_sessions_log')
         while True:
+            if not self._connecting_params:
+                break
+            ssl_check = None if self._connecting_params['ssl_check'] else False
+            url = self._connecting_params['url']
+            headers = self._connecting_params['headers']
+            autoping = self._connecting_params['autoping']
+
             try:
                 async with aiohttp.ClientSession() as session:
-                    ssl_check = None if self.state.get_value('ssl_check') else False
-                    url = self.state.get_value('url')
-
                     async with session.ws_connect(
                         url,
-                        headers=self.state.get_value('headers'),
-                        autoping=self.state.get_value('autoping'),
+                        headers=headers,
+                        autoping=autoping,
                         ssl=ssl_check
                     ) as ws:
                         try:
@@ -405,7 +409,9 @@ class WsApp(App):
                 break
 
             await asyncio.sleep(1)
-            log.write(f'[yellow]Reconnecting to: {self.state.get_value("url")}')
+            if not self._connecting_params:
+                break
+            log.write(f'[yellow]Reconnecting to: {url}')
 
     def refresh_headers(self):
         headers_list = self.query_one('#headers_list')
@@ -544,16 +550,19 @@ class WsApp(App):
             self._connect_task.cancel()
             self._ws = None
 
-        if self._connecting:
-            self._connecting = False
+        if self._connecting_params:
+            self._connecting_params = None
             return
 
         button = self.query_one('#connect')
         button.label = 'Disconnect'
-        self._connecting = True
+        self._connecting_params = {
+            'url': addr,
+            'headers': self.state.get_value('headers'),
+            'autoping': self.state.get_value('autoping'),
+            'ssl_check': self.state.get_value('ssl_check')
+        }
 
-
-        self.state.set_value('url', addr)
         log.write(f'Connecting to: {addr}')
 
         self._connect_task = asyncio.create_task(self.connect())
@@ -646,6 +655,10 @@ class WsApp(App):
     @on(Switch.Changed, '#autoping')
     def autoping_switch(self, message: Message):
         self.state.set_value('autoping', message.value)
+
+    @on(AddressInput.Changed, '#address')
+    def address_switch(self, message: Message):
+        self.state.set_value('url', message.value)
 
     @on(Switch.Changed, '#auto_reconnect')
     def auto_reconnect_switch(self, message: Message):
