@@ -847,6 +847,9 @@ class WsApp(App):
 
         data = await self.get_key_from_modal(modal_title, name=orig_key_name)
 
+        if data is None:
+            return
+
         if orig_key_name is None:
             if self.state.get_value(section) and data in self.state.get_value(section):
                 # unable to create as record already exists
@@ -880,6 +883,9 @@ class WsApp(App):
             value = self.state.get_value(section).get(orig_key_name, '')
 
         key, value = await self.get_key_value_from_modal(modal_title, name=orig_key_name, value=value)
+
+        if key is None:
+            return (None, None)
 
         if orig_key_name is None:
             if self.state.get_value(section) and key in self.state.get_value(section):
