@@ -6,6 +6,7 @@ import shutil
 from time import time
 from typing import Any
 import tempfile
+from string import Template
 
 import aiohttp
 from aiohttp.http_websocket import WSMessage
@@ -30,6 +31,7 @@ from textual.widgets.option_list import Option
 from textual.events import Event
 from textual.message import Message
 from textual.containers import Grid
+from textual.containers import ScrollableContainer
 from textual.screen import ModalScreen
 from textual import on
 from textual import work
@@ -80,6 +82,10 @@ class HorizontalHAuto(Widget):
     """
 
 
+def render_template(template: str, variables: dict) -> str:
+    return Template(template).safe_substitute(variables)
+
+
 class State:
     def __init__(self, filename: str = None):
         if not filename:
@@ -90,7 +96,18 @@ class State:
         self.configurations = {
             'default': self.default_configuration
         }
+        self.globals = {}
+
+        self.contexts = {'default': self.default_context}
+        self.context_name = 'default'
+
         self.loaded = False
+
+    @property
+    def default_context(self):
+        return {
+            'context_variables': {}
+        }
 
     @property
     def default_configuration(self):
@@ -98,7 +115,7 @@ class State:
             'url': '',
             'headers': {},
             'autoping': False,
-            'texs': {'': ''},
+            'texts': {'': ''},
             'auto_reconnect': True,
             'ssl_check': True
         }
@@ -110,25 +127,50 @@ class State:
             self.configuration_name = list(self.configurations.keys())[0]
             return self.configurations[self.configuration_name]
 
+    def get_context(self):
+        try:
+            return self.contexts[self.context_name]
+        except KeyError:
+            self.context_name = list(self.contexts.keys())[0]
+            return self.contexts[self.context_name]
+
+    def get_variables(self):
+        variables = dict()
+        variables.update(self.globals)
+        variables.update(self.get_context().get('context_variables', {}))
+        return variables
+
     def get_value(self, key, default=None):
+        if key == 'configurations':
+            return self.configurations
+        if key == 'globals':
+            return self.globals
+        if key == 'contexts':
+            return self.contexts
+        if key == 'context_variables':
+            return self.get_context().get('context_variables')
         return self.get_configuration().get(key, default)
 
     def set_value(self, key: str, value: Any):
         self.get_configuration()[key] = value
 
-    def add_configuration(self, name: str, data=None):
-        if data is None:
-            data = self.default_configuration
-
-        self.configurations[name] = data
-
     def delete_configuration(self, name: str):
         if name in self.configurations:
             del self.configurations[name]
             if not self.configurations:
-                self.add_configuration('default')
+                self.configurations['default'] = self.default_configuration
+                self.context_name = 'default'
             if self.configuration_name == name:
                 self.configuration_name = list(self.configurations.keys())[0]
+
+    def delete_context(self, name: str):
+        if name in self.contexts:
+            del self.contexts[name]
+            if not self.contexts:
+                self.contexts['default'] = self.default_context
+                self.context_name = 'default'
+            if self.context_name == name:
+                self.context_name = list(self.contexts.keys())[0]
 
     def load(self):
         if not os.path.exists(self.state_filename):
@@ -138,7 +180,10 @@ class State:
             with open(self.state_filename, 'r', encoding='utf8') as fil:
                 state_file = json.load(fil)
                 self.configurations = state_file.get('configurations', self.configurations)
+                self.globals = state_file.get('globals', self.globals)
                 self.configuration_name = state_file.get('selected_configuration', 'default')
+                self.contexts = state_file.get('contexts', self.contexts)
+                self.context_name = state_file.get('selected_context', 'default')
                 self.loaded = True
         except Exception as exc:
             print(exc)
@@ -146,7 +191,11 @@ class State:
     def save(self):
         state_data = {
             'configurations': self.configurations,
-            'selected_configuration': self.configuration_name
+            'selected_configuration': self.configuration_name,
+            'globals': self.globals,
+            'contexts': self.contexts,
+            'selected_context': self.context_name
+
         }
         if self.loaded:
             with tempfile.NamedTemporaryFile(mode="w", buffering=1) as fil:
@@ -176,24 +225,24 @@ class WsRichLog(RichLog):
         self.app.query_one('#log_status').auto_scroll = self.auto_scroll
 
 
-class EditModalScreen(ModalScreen):
+class EditNameModalScreen(ModalScreen):
     CSS = """
-        EditModalScreen {
+        EditNameModalScreen {
             align: center middle;
         }
-        EditModalScreen > Vertical {
+        EditNameModalScreen > Vertical {
             background: #101030;
             border: tall #303040;
             height: 12;
             width: 70;
         }
-        EditModalScreen #content {
+        EditNameModalScreen #content {
             margin: 0 1;
         }
-        EditModalScreen Label {
+        EditNameModalScreen Label {
             margin: 0 1;
         }
-        EditModalScreen #buttons {
+        EditNameModalScreen #buttons {
             margin: 0 1;
         }
     """
@@ -242,39 +291,40 @@ class EditModalScreen(ModalScreen):
                     )
 
 
-class EditHeaderScreen(ModalScreen):
+class EditNameValueScreen(ModalScreen):
     CSS = """
-        EditHeaderScreen {
+        EditNameValueScreen {
             align: center middle;
         }
-        EditHeaderScreen > Vertical {
+        EditNameValueScreen > Vertical {
             background: #101030;
             border: tall #303040;
             height: 12;
             width: 70;
         }
-        EditHeaderScreen #content {
+        EditNameValueScreen #content {
             margin: 0 1;
         }
-        EditHeaderScreen Label {
+        EditNameValueScreen Label {
             margin: 0 1;
         }
-        EditHeaderScreen #buttons {
+        EditNameValueScreen #buttons {
             margin: 0 1;
         }
     """
-    def __init__(self, name=None, value=None) -> None:
+    def __init__(self, title, name=None, value=None) -> None:
         self.key_name = name
         self.value = value
+        self.modal_title = title
         super().__init__()
 
     @on(Button.Pressed, '#add')
     def add(self, message: Message):
-        self.dismiss((self.query_one('#header_name').value, self.query_one('#header_value').value))
+        self.dismiss((self.query_one('#imput_name').value, self.query_one('#input_value').value))
 
     @on(Button.Pressed, '#save')
     def save(self, message: Message):
-        self.dismiss((self.query_one('#header_name').value, self.query_one('#header_value').value))
+        self.dismiss((self.query_one('#imput_name').value, self.query_one('#input_value').value))
 
     @on(Button.Pressed, '#cancel')
     def cancel(self, message: Message):
@@ -282,7 +332,7 @@ class EditHeaderScreen(ModalScreen):
 
     @on(Input.Submitted)
     def submit(self, message: Message):
-        self.dismiss((self.query_one('#header_name').value, self.query_one('#header_value').value))
+        self.dismiss((self.query_one('#imput_name').value, self.query_one('#input_value').value))
 
     def on_key(self, event: Event):
         if event.key == 'escape':
@@ -291,12 +341,9 @@ class EditHeaderScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         with Vertical():
             with Vertical(id='content'):
-                if self.key_name:
-                    yield Label('Edit Header')
-                else:
-                    yield Label('Add Header')
-                yield Input(placeholder='Name', id='header_name', value=self.key_name)
-                yield Input(placeholder='Value', id='header_value', value=self.value)
+                yield Label(self.modal_title)
+                yield Input(placeholder='Name', id='imput_name', value=self.key_name)
+                yield Input(placeholder='Value', id='input_value', value=self.value)
 
                 if self.key_name:
                     yield Horizontal(
@@ -326,8 +373,8 @@ class LogStatus(Label):
     auto_scroll = reactive(True)
 
     def render(self):
-        return (f" Word wrapping: [cyan]w[/cyan] ({'On' if self.word_wrap else 'Off'}) Clear: "
-            f"[cyan]c[/cyan] Scroll: [cyan]s[/cyan] ({'On' if self.auto_scroll else 'Off'})")
+        return (f" Word wrapping: [cyan]w[/cyan] ( {'On ' if self.word_wrap else 'Off'} ) Clear: "
+            f"[cyan]c[/cyan] Scroll: [cyan]s[/cyan] ( {'On ' if self.auto_scroll else 'Off'} )   ")
 
 
 class SendTextArea(TextArea):
@@ -413,24 +460,6 @@ class WsApp(App):
                 break
             log.write(f'[yellow]Reconnecting to: {url}')
 
-    def refresh_headers(self):
-        headers_list = self.query_one('#headers_list')
-        headers_list.clear_options()
-        headers_list.add_options(
-            [Option(f'{k}: {v}', id=k) for k, v in self.state.get_value('headers').items()]
-        )
-
-    def refresh_texts(self):
-        text_list = self.query_one('#texts')
-        values = [(x, x) for x in self.state.get_value('texts', {'': ''}).keys()]
-        text_list.set_options(values)
-        text_list.value = self.state.get_value('text_selected', values[0][0])
-
-    def refresh_configurations(self):
-        config_list = self.query_one('#configurations_list')
-        config_list.set_options([(x, x) for x in self.state.configurations.keys()])
-        config_list.value = self.state.configuration_name
-
     def refresh_fields(self):
         self.query_one(AddressInput).value = self.state.get_value('url')
         self.query_one(SendTextArea).text = (
@@ -439,23 +468,21 @@ class WsApp(App):
         self.query_one('#autoping').value = self.state.get_value('autoping')
         self.query_one('#auto_reconnect').value = self.state.get_value('auto_reconnect')
         self.query_one('#ssl_check').value = self.state.get_value('ssl_check')
+        self.query_one('#template_url').value = self.state.get_value('template_url')
+        self.query_one('#template_data').value = self.state.get_value('template_data')
         self.refresh_headers()
+        self.refresh_globals()
+        self.refresh_contexts()
+        self.refresh_context_variables()
+
+    # Headers
 
     @work
     @on(Button.Pressed, '#add_header')
     async def on_add_header_menu_button_message(self, message: Message):
-        screen = EditHeaderScreen()
-
-        data = await self.push_screen_wait(
-            screen
-        )
-
-        if not data:
-            return
-
-        self.state.get_value('headers')[data[0]] = data[1]
-
-        self.refresh_headers()
+        key, _ = await self.edit_config_state_config_key_value('Add Header', 'headers')
+        if key:
+            self.refresh_headers()
 
     @work
     @on(Button.Pressed, '#edit_header')
@@ -470,40 +497,184 @@ class WsApp(App):
         if not selected.id:
             return
 
-        screen = EditHeaderScreen(name=selected.id, value=self.state.get_value('headers')[selected.id])
+        key, _ = await self.edit_config_state_config_key_value('Edit Header', 'headers', orig_key_name=selected.id)
 
-        data = await self.push_screen_wait(
-            screen
-        )
-
-        if not data:
+        if not key:
             return
 
-        self.state.get_value('headers').pop(selected.id)
-        self.state.get_value('headers')[data[0]] = data[1]
-
         self.refresh_headers()
+
+    @on(Button.Pressed, '#delete_header')
+    def delete_header(self, message: Message):
+        headers_list = self.query_one('#headers_list')
+
+        if headers_list.highlighted is None:
+            return
+
+        selected = headers_list.get_option_at_index(headers_list.highlighted)
+        if selected:
+            del self.state.get_value('headers')[selected.id]
+            self.refresh_headers()
+
+    def refresh_headers(self):
+        headers_list = self.query_one('#headers_list')
+        headers_list.clear_options()
+        headers_list.add_options(
+            [Option(f'{k}: {v}', id=k) for k, v in self.state.get_value('headers').items()]
+        )
+
+    # Global Variables
+
+    @work
+    @on(Button.Pressed, '#add_global_variable')
+    async def on_add_global_variable_menu_button_message(self, message: Message):
+        key, _ = await self.edit_config_state_config_key_value('Add global variable', 'globals')
+        if key:
+            self.refresh_globals()
+
+    @work
+    @on(Button.Pressed, '#edit_global_variable')
+    async def on_edit_global_variable_menu_button_message(self, message: Message):
+        headers_list = self.query_one('#global_variables')
+
+        if headers_list.highlighted is None:
+            return
+
+        selected = headers_list.get_option_at_index(headers_list.highlighted)
+
+        if not selected.id:
+            return
+
+        key, _ = await self.edit_config_state_config_key_value('Edit Global Variable', 'globals', orig_key_name=selected.id)
+
+        if not key:
+            return
+
+        self.refresh_globals()
+
+    @on(Button.Pressed, '#delete_global_variable')
+    def delete_global_variable(self, message: Message):
+        headers_list = self.query_one('#global_variables')
+
+        if headers_list.highlighted is None:
+            return
+
+        selected = headers_list.get_option_at_index(headers_list.highlighted)
+        if selected:
+            del self.state.get_value('globals')[selected.id]
+            self.refresh_globals()
+
+    def refresh_globals(self):
+        globals_list = self.query_one('#global_variables')
+        globals_list.clear_options()
+        globals_list.add_options(
+            [Option(f'{k}: {v}', id=k) for k, v in self.state.get_value('globals').items()]
+        )
+
+    # Context Variables
+    @work
+    @on(Button.Pressed, '#add_context')
+    async def on_add_context(self, message: Message):
+        name = await self.edit_config_state_config_key(
+            'Add Context',
+            'contexts',
+            default_value=self.state.default_context
+        )
+
+        if name:
+            self.refresh_contexts()
+
+    @work
+    @on(Button.Pressed, '#edit_context')
+    async def on_edit_context(self, message: Message):
+        orig_name = self.state.context_name
+
+        name = await self.edit_config_state_config_key(
+            'Edit Context',
+            'contexts',
+            orig_key_name=orig_name
+        )
+
+        if name:
+            self.state.context_name = name
+            self.refresh_contexts()
+
+    @on(Button.Pressed, '#delete_context')
+    def delete_context(self, message: Message):
+        config_list = self.query_one('#contexts_list')
+        selected = config_list.value
+        if selected:
+            self.state.delete_context(selected)
+            self.state.context_name = list(self.state.contexts.keys())[0]
+            self.refresh_fields()
+            self.refresh_contexts()
+
+    def refresh_contexts(self):
+        config_list = self.query_one('#contexts_list')
+        config_list.set_options([(x, x) for x in self.state.contexts.keys()])
+        config_list.value = self.state.context_name
+
+
+    @work
+    @on(Button.Pressed, '#add_context_variable')
+    async def on_add_context_variable_menu_button_message(self, message: Message):
+        key, _ = await self.edit_config_state_config_key_value('Add context variable', 'context_variables')
+        if key:
+            self.refresh_context_variables()
+
+    @work
+    @on(Button.Pressed, '#edit_context_variable')
+    async def on_edit_context_variable_menu_button_message(self, message: Message):
+        headers_list = self.query_one('#context_variables')
+
+        if headers_list.highlighted is None:
+            return
+
+        selected = headers_list.get_option_at_index(headers_list.highlighted)
+
+        if not selected.id:
+            return
+
+        key, _ = await self.edit_config_state_config_key_value(
+            'Edit context Variable',
+            'context_variables',
+            orig_key_name=selected.id
+        )
+
+        if not key:
+            return
+
+        self.refresh_context_variables()
+
+    @on(Button.Pressed, '#delete_context_variable')
+    def delete_context_variable(self, message: Message):
+        headers_list = self.query_one('#context_variables')
+
+        if headers_list.highlighted is None:
+            return
+
+        selected = headers_list.get_option_at_index(headers_list.highlighted)
+        if selected:
+            del self.state.get_value('context_variables')[selected.id]
+            self.refresh_context_variables()
+
+    def refresh_context_variables(self):
+        globals_list = self.query_one('#context_variables')
+        globals_list.clear_options()
+        globals_list.add_options(
+            [Option(f'{k}: {v}', id=k) for k, v in self.state.get_value('context_variables').items()]
+        )
+
+    # Texts
 
     @work
     @on(Button.Pressed, '#add_text')
     async def on_add_text_select_item(self, message: Message):
-        screen = EditModalScreen('Add Text')
-
-        data = await self.push_screen_wait(
-            screen
-        )
-
-        if not data:
-            return
-
-        if self.state.get_value('texts') and data in self.state.get_value('texts'):
-            # Exists
-            return
-
         if not self.state.get_value('texts'):
             self.state.set_value('texts', {})
 
-        self.state.get_value('texts')[data] = ''
+        await self.edit_config_state_config_key('Add Text', 'texts')
+
         self.refresh_texts()
 
     @work
@@ -515,23 +686,77 @@ class WsApp(App):
         if selected is None:
             return
 
-        screen = EditModalScreen('Edit text', name=selected)
+        new_name = await self.edit_config_state_config_key('Edit Text', 'texts', orig_key_name=selected)
 
-        data = await self.push_screen_wait(
-            screen
-        )
-
-        if not data:
+        if not new_name:
             return
 
-        if self.state.get_value('texts') and data in self.state.get_value('texts'):
-            # Exists
-            return
-
-        self.state.get_value('texts')[data] = self.state.get_value('texts').pop(selected)
-        self.state.set_value('text_selected', data)
+        self.state.set_value('text_selected', new_name)
 
         self.refresh_texts()
+
+    @on(Button.Pressed, '#delete_text')
+    def delete_text(self, message: Message):
+        texts_list = self.query_one('#texts')
+
+        selected = texts_list.value
+
+        if selected is None:
+            return
+
+        self.state.get_value('texts').pop(selected.id)
+
+        self.refresh_texts()
+
+    def refresh_texts(self):
+        text_list = self.query_one('#texts')
+        values = [(x, x) for x in self.state.get_value('texts', {'': ''}).keys()]
+        text_list.set_options(values)
+        text_list.value = self.state.get_value('text_selected', values[0][0])
+
+    # Configurations
+
+    @work
+    @on(Button.Pressed, '#add_configuration')
+    async def on_add_configuration(self, message: Message):
+        name = await self.edit_config_state_config_key(
+            'Add Configuration',
+            'configurations',
+            default_value=self.state.default_configuration
+        )
+
+        if name:
+            self.refresh_configurations()
+
+    @work
+    @on(Button.Pressed, '#edit_configuration')
+    async def on_edit_configuration(self, message: Message):
+        orig_name = self.state.configuration_name
+
+        name = await self.edit_config_state_config_key(
+            'Edit Configuration',
+            'configurations',
+            orig_key_name=orig_name
+        )
+
+        if name:
+            self.state.configuration_name = name
+            self.refresh_configurations()
+
+    @on(Button.Pressed, '#delete_configuration')
+    def delete_configuration(self, message: Message):
+        config_list = self.query_one('#configurations_list')
+        selected = config_list.value
+        if selected:
+            self.state.delete_configuration(selected)
+            self.state.configuration_name = list(self.state.configurations.keys())[0]
+            self.refresh_fields()
+            self.refresh_configurations()
+
+    def refresh_configurations(self):
+        config_list = self.query_one('#configurations_list')
+        config_list.set_options([(x, x) for x in self.state.configurations.keys()])
+        config_list.value = self.state.configuration_name
 
     def on_mount(self):
         self.refresh_fields()
@@ -542,6 +767,10 @@ class WsApp(App):
     async def on_connect_button_message(self, message: Message):
         log = self.query_one('#ws_sessions_log')
         addr = self.query_one(AddressInput).value
+
+        if self.state.get_value('template_url'):
+            vars = self.state.get_variables()
+            addr = render_template(addr, self.state.get_variables())
 
         if self._connect_task:
             button = self.query_one('#connect')
@@ -579,35 +808,97 @@ class WsApp(App):
                 else:
                     text = textar.text
 
+                if self.state.get_value('template_data'):
+                    text = render_template(text, self.state.get_variables())
+
                 await self._ws.send_str(text)
                 log.write(f'[yellow]Sent: {text}')
             except Exception as exc:
                 log.write(f'[red]Error: {exc}')
 
-    @on(Button.Pressed, '#delete_header')
-    def delete_header(self, message: Message):
-        headers_list = self.query_one('#headers_list')
+    async def get_key_from_modal(self, title: str, name: str = None) -> str:
+        screen = EditNameModalScreen(title, name=name)
 
-        if headers_list.highlighted is None:
+        data = await self.push_screen_wait(
+            screen
+        )
+
+        return data
+
+    async def get_key_value_from_modal(self, title: str, name: str = None, value: str = None) -> str:
+        screen = EditNameValueScreen(title, name=name, value=value)
+
+        data = await self.push_screen_wait(
+            screen
+        )
+
+        if not data:
+            return (None, None)
+
+        return (data[0], data[1])
+
+    async def edit_config_state_config_key(
+            self,
+            modal_title: str,
+            section: str,
+            orig_key_name: str = None,
+            default_value: str = ''
+        ) -> None|str:
+
+        data = await self.get_key_from_modal(modal_title, name=orig_key_name)
+
+        if orig_key_name is None:
+            if self.state.get_value(section) and data in self.state.get_value(section):
+                # unable to create as record already exists
+                return
+            self.state.get_value(section)[data] = default_value
+            return data
+
+        if orig_key_name and data == orig_key_name:
+            return data
+
+        if (orig_key_name and
+            orig_key_name != data and
+            self.state.get_value(section) and
+            data in self.state.get_value(section)
+        ):
+            # unable to rename as record already exists
             return
 
-        selected = headers_list.get_option_at_index(headers_list.highlighted)
-        if selected:
-            del self.state.get_value('headers')[selected.id]
-            self.refresh_headers()
+        self.state.get_value(section)[data] = self.state.get_value(section).pop(orig_key_name)
+        return data
 
-    @on(Button.Pressed, '#delete_text')
-    def delete_text(self, message: Message):
-        texts_list = self.query_one('#texts')
+    async def edit_config_state_config_key_value(
+            self,
+            modal_title: str,
+            section: str,
+            orig_key_name: str = None
+        ) -> None|str:
 
-        selected = texts_list.value
+        value = ''
+        if orig_key_name:
+            value = self.state.get_value(section).get(orig_key_name, '')
 
-        if selected is None:
-            return
+        key, value = await self.get_key_value_from_modal(modal_title, name=orig_key_name, value=value)
 
-        self.state.get_value('texts').pop(selected.id)
+        if orig_key_name is None:
+            if self.state.get_value(section) and key in self.state.get_value(section):
+                # unable to create as record already exists
+                return (None, None)
+            self.state.get_value(section)[key] = value
+            return (key, value)
 
-        self.refresh_texts()
+        if (orig_key_name and
+            orig_key_name != key and
+            self.state.get_value(section) and
+            key in self.state.get_value(section)
+        ):
+            # unable to rename as record already exists
+            return (None, None)
+
+        self.state.get_value(section).pop(orig_key_name)
+        self.state.get_value(section)[key] = value
+        return (key, value)
 
     @on(AddressInput.Submitted)
     def submit_connect(self, message: Message):
@@ -622,35 +913,6 @@ class WsApp(App):
                 log.write('[yellow]Ping sent')
             except Exception as exc:
                 log.write(f'[red]Error: {exc}')
-
-    @work
-    @on(Button.Pressed, '#add_configuration')
-    async def on_add_configuration(self, message: Message):
-        screen = EditModalScreen('Add Configuration')
-
-        data = await self.push_screen_wait(
-            screen
-        )
-
-        if not data:
-            return
-
-        if self.state.get_value('configurations') and data in self.state.get_value('configurations'):
-            # Exists
-            return
-
-        self.state.add_configuration(data)
-        self.refresh_configurations()
-
-    @on(Button.Pressed, '#delete_configuration')
-    def delete_configuration(self, message: Message):
-        config_list = self.query_one('#configurations_list')
-        selected = config_list.value
-        if selected:
-            self.state.delete_configuration(selected)
-            self.state.configuration_name = list(self.state.configurations.keys())[0]
-            self.refresh_fields()
-            self.refresh_configurations()
 
     @on(Switch.Changed, '#autoping')
     def autoping_switch(self, message: Message):
@@ -667,6 +929,22 @@ class WsApp(App):
     @on(Switch.Changed, '#ssl_check')
     def ssl_check_switch(self, message: Message):
         self.state.set_value('ssl_check', message.value)
+
+    @on(Switch.Changed, '#template_url')
+    def template_url_switch(self, message: Message):
+        self.state.set_value('template_url', message.value)
+
+    @on(Switch.Changed, '#template_data')
+    def template_data_switch(self, message: Message):
+        self.state.set_value('template_data', message.value)
+
+    @on(Select.Changed, '#contexts_list')
+    def change_context(self, message: Message):
+        selected = message.value
+
+        if selected:
+            self.state.context_name = selected
+            self.refresh_context_variables()
 
     @on(Select.Changed, '#configurations_list')
     def change_configuration(self, message: Message):
@@ -711,7 +989,7 @@ class WsApp(App):
         )
 
     def compse_options_tab(self):
-        yield Vertical(
+        yield ScrollableContainer(
             Label('Headers'),
             HorizontalHAuto(
                 OptionList(id='headers_list'),
@@ -731,13 +1009,42 @@ class WsApp(App):
                 Label('\nCheck SSL:'),
                 Switch(self.state.get_value('ssl_check'), animate=True, id='ssl_check')
             ),
+            HorizontalHAuto(
+                Label('\nUse Temlate for the url:'),
+                Switch(self.state.get_value('template_url'), animate=True, id='template_url')
+            ),
+            HorizontalHAuto(
+                Label('\nUse templates for the data being sent.:'),
+                Switch(self.state.get_value('template_data'), animate=True, id='template_data')
+            ),
             Label('Configurations'),
             HorizontalHAuto(
                 Select([('', '')], id='configurations_list'),
                 Button('Add', id='add_configuration'),
                 Button('Delete', id='delete_configuration'),
                 Button('Edit', id='edit_configuration'),
-            )
+            ),
+            Label('Contexts'),
+            HorizontalHAuto(
+                Select([('', '')], id='contexts_list'),
+                Button('Add', id='add_context'),
+                Button('Delete', id='delete_context'),
+                Button('Edit', id='edit_context'),
+            ),
+            Label('Context Variables (overrides global variables)'),
+            HorizontalHAuto(
+                OptionList(id='context_variables'),
+                Button('Add', id='add_context_variable'),
+                Button('Delete', id='delete_context_variable'),
+                Button('Edit', id='edit_context_variable'),
+            ),
+            Label('Global Variables'),
+            HorizontalHAuto(
+                OptionList(id='global_variables'),
+                Button('Add', id='add_global_variable'),
+                Button('Delete', id='delete_global_variable'),
+                Button('Edit', id='edit_global_variable'),
+            ),
         )
 
     def set_status_text(self, text: str):
