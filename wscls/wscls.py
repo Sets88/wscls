@@ -37,6 +37,11 @@ from textual import on
 from textual import work
 
 
+HTTP_METHODS = [
+    'WS', 'GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'
+]
+
+
 class ConfigurationAddGrid(Widget):
     DEFAULT_CSS = """
     ConfigurationAddGrid {
@@ -55,7 +60,7 @@ class MainGrid(Grid):
         width: 1fr;
         height: 1fr;
         layout: grid;
-        grid-rows: 4 1 5fr 1fr 30%
+        grid-rows: 4 1 5fr 3 30%
     }
     """
 
@@ -66,8 +71,8 @@ class ConnectContainer(Widget):
         width: 1fr;
         height: auto;
         layout: grid;
-        grid-columns: 1fr 15;
-        grid-size-columns: 2;
+        grid-columns: 1fr 15 15;
+        grid-size-columns: 3;
     }
     """
 
@@ -78,6 +83,26 @@ class HorizontalHAuto(Widget):
         width: 1fr;
         height: auto;
         layout: horizontal;
+    }
+    """
+
+
+class SwitchContainer(Widget):
+    DEFAULT_CSS = """
+    SwitchContainer {
+        width: 50;
+        height: auto;
+        layout: grid;
+        grid-columns: 2fr 15;
+        grid-size-columns: 2;
+    }
+    """
+
+
+class NarrowButton(Button):
+    DEFAULT_CSS = """
+    NarrowButton {
+        min-width: 8;
     }
     """
 
@@ -113,11 +138,22 @@ class State:
     def default_configuration(self):
         return {
             'url': '',
+            'method': 'WS',
             'headers': {},
             'autoping': False,
-            'texts': {'': ''},
+            'texts': {'': self.default_text},
             'auto_reconnect': True,
-            'ssl_check': True
+            'ssl_check': True,
+            'show_headers': False,
+            'follow_redirects': True,
+            'stick_url_to_text': False
+        }
+
+    @property
+    def default_text(self):
+        return {
+            'text': '',
+            'url': ''
         }
 
     def get_configuration(self):
@@ -150,6 +186,19 @@ class State:
         if key == 'context_variables':
             return self.get_context().get('context_variables')
         return self.get_configuration().get(key, default)
+
+    def get_current_text(self):
+        if not self.get_value('texts'):
+            self.set_value('texts', self.default_text)
+        if self.get_value('text_selected') not in self.get_value('texts'):
+            self.set_value('text_selected', list(self.get_value('texts').keys())[0])
+
+        current_text = self.get_value('texts').get(self.get_value('text_selected'))
+
+        if isinstance(current_text, str):
+            current_text = {'text': current_text, 'url': ''}
+            self.get_value('texts')[self.get_value('text_selected')] = current_text
+        return current_text
 
     def set_value(self, key: str, value: Any):
         self.get_configuration()[key] = value
@@ -383,7 +432,7 @@ class SendTextArea(TextArea):
         Binding('ctrl+f', 'send_message')
     ]
     def on_text_area_changed(self, event: Event):
-        self.app.state.get_value('texts', {})[self.app.state.get_value('text_selected')] = self.text
+        self.app.state.get_current_text()['text'] = self.text
 
     async def action_send_message(self):
         self.app.query_one('#send_message').action_press()
@@ -409,7 +458,7 @@ class WsApp(App):
             log.write(f'[cyan]Received: {msg.data}')
 
     def on_connected(self, log: RichLog, url: str):
-        text = f'[green]Connected to: {self.state.get_value("url")}'
+        text = f'[green]Connected to: {url}'
         log.write(text)
         self.set_status_text(text)
         log.styles.border = ('heavy', 'green')
@@ -420,52 +469,102 @@ class WsApp(App):
         log.write(text)
         log.styles.border = ('heavy', 'red')
 
+    async def connect_ws(self, session: aiohttp.ClientSession, log: RichLog):
+        ssl_check = None if self._connecting_params['ssl_check'] else False
+        url = self._connecting_params['url']
+        headers = self._connecting_params['headers']
+        autoping = self._connecting_params['autoping']
+
+        async with session.ws_connect(
+            url,
+            headers=headers,
+            autoping=autoping,
+            ssl=ssl_check
+        ) as ws:
+            try:
+                self._ws = ws
+                self.on_connected(log, url)
+                async for msg in ws:
+                    await self.process_incomming_ws_message(log, msg)
+
+                log.write(f'[red]Closed by remote side with code: {ws.close_code}')
+            except Exception as exc:
+                log.write(f'[red]Error: {exc}')
+            finally:
+                self.on_disconnected(log)
+
+    async def connect_http(self, session: aiohttp.ClientSession, log: RichLog):
+        url = self._connecting_params['url']
+        method = self._connecting_params['method']
+        headers = self._connecting_params['headers']
+        ssl_check = None if self._connecting_params['ssl_check'] else False
+
+        follow_redirects = self.state.get_value('follow_redirects')
+
+        textar = self.query_one(SendTextArea)
+        if textar.selected_text:
+            text = textar.selected_text
+        else:
+            text = textar.text
+
+        if self.state.get_value('template_data'):
+            text = render_template(text, self.state.get_variables())
+
+        async with session.request(
+            method,
+            url,
+            headers=headers,
+            ssl=ssl_check,
+            data=text,
+            allow_redirects=follow_redirects
+        ) as resp:
+            log.write(f'[cyan]Request: {method} {url}')
+            log.write(f'[cyan]Response: {resp.status}')
+            if self.state.get_value('show_headers'):
+                log.write(f'[cyan]Headers:\n   {(chr(10) + "   ").join([f"{key}: {value}" for key, value in resp.headers.items()])}')
+            log.write(f'[cyan]Body: \n{await resp.text()}')
+
     async def connect(self):
         log = self.query_one('#ws_sessions_log')
         while True:
             if not self._connecting_params:
                 break
-            ssl_check = None if self._connecting_params['ssl_check'] else False
-            url = self._connecting_params['url']
-            headers = self._connecting_params['headers']
-            autoping = self._connecting_params['autoping']
 
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(
-                        url,
-                        headers=headers,
-                        autoping=autoping,
-                        ssl=ssl_check
-                    ) as ws:
-                        try:
-                            self._ws = ws
-                            self.on_connected(log, url)
-                            async for msg in ws:
-                                await self.process_incomming_ws_message(log, msg)
-
-                            log.write(f'[red]Closed by remote side with code: {ws.close_code}')
-                        except Exception as exc:
-                            log.write(f'[red]Error: {exc}')
-                        finally:
-                            self.on_disconnected(log)
+                async with aiohttp.ClientSession(raise_for_status=True) as session:
+                    if self._connecting_params['method'] == 'WS':
+                        await self.connect_ws(session, log)
+                    else:
+                        await self.connect_http(session, log)
             except Exception as exc:
                 log.write(f'[red]Error: {exc}')
 
-            if not self.state.get_value('auto_reconnect'):
+            if not self.state.get_value('auto_reconnect') or self._connecting_params['method'] != 'WS':
+                button = self.query_one('#connect')
+                button.label = 'Connect'
+
+                self._connecting_params = None
+
                 break
 
             await asyncio.sleep(1)
             if not self._connecting_params:
                 break
-            log.write(f'[yellow]Reconnecting to: {url}')
+
+            log.write(f'[yellow]Reconnecting to: {self._connecting_params["url"]}')
 
     def refresh_fields(self):
         self.query_one(AddressInput).value = self.state.get_value('url')
+
         self.query_one(SendTextArea).text = (
-            self.state.get_value('texts', {'': ''}).get(self.state.get_value('text_selected'), '')
+            self.state.get_current_text()['text']
         )
+
         self.query_one('#autoping').value = self.state.get_value('autoping')
+        self.query_one('#show_headers').value = self.state.get_value('show_headers')
+        self.query_one('#stick_url_to_text').value = self.state.get_value('stick_url_to_text')
+        self.query_one('#follow_redirects').value = self.state.get_value('follow_redirects')
+        self.query_one('#method').value = self.state.get_value('method', 'WS')
         self.query_one('#auto_reconnect').value = self.state.get_value('auto_reconnect')
         self.query_one('#ssl_check').value = self.state.get_value('ssl_check')
         self.query_one('#template_url').value = self.state.get_value('template_url')
@@ -670,10 +769,7 @@ class WsApp(App):
     @work
     @on(Button.Pressed, '#add_text')
     async def on_add_text_select_item(self, message: Message):
-        if not self.state.get_value('texts'):
-            self.state.set_value('texts', {})
-
-        await self.edit_config_state_config_key('Add Text', 'texts')
+        await self.edit_config_state_config_key('Add Text', 'texts', default_value=self.state.default_text)
 
         self.refresh_texts()
 
@@ -704,13 +800,15 @@ class WsApp(App):
         if selected is None:
             return
 
-        self.state.get_value('texts').pop(selected.id)
+        self.state.get_value('texts').pop(selected)
+
+        self.state.get_current_text()
 
         self.refresh_texts()
 
     def refresh_texts(self):
         text_list = self.query_one('#texts')
-        values = [(x, x) for x in self.state.get_value('texts', {'': ''}).keys()]
+        values = [(x, x) for x in self.state.get_value('texts').keys()]
         text_list.set_options(values)
         text_list.value = self.state.get_value('text_selected', values[0][0])
 
@@ -789,7 +887,9 @@ class WsApp(App):
             'url': addr,
             'headers': self.state.get_value('headers'),
             'autoping': self.state.get_value('autoping'),
-            'ssl_check': self.state.get_value('ssl_check')
+            'ssl_check': self.state.get_value('ssl_check'),
+            'method': self.state.get_value('method', 'WS'),
+            'follow_redirects': self.state.get_value('follow_redirects')
         }
 
         log.write(f'Connecting to: {addr}')
@@ -815,6 +915,9 @@ class WsApp(App):
                 log.write(f'[yellow]Sent: {text}')
             except Exception as exc:
                 log.write(f'[red]Error: {exc}')
+
+        if self.state.get_value('method') != 'WS':
+            self.query_one('#connect').action_press()
 
     async def get_key_from_modal(self, title: str, name: str = None) -> str:
         screen = EditNameModalScreen(title, name=name)
@@ -920,6 +1023,18 @@ class WsApp(App):
             except Exception as exc:
                 log.write(f'[red]Error: {exc}')
 
+    @on(Switch.Changed, '#show_headers')
+    def show_headers_switch(self, message: Message):
+        self.state.set_value('show_headers', message.value)
+
+    @on(Switch.Changed, '#stick_url_to_text')
+    def stick_url_to_text_switch(self, message: Message):
+        self.state.set_value('stick_url_to_text', message.value)
+
+    @on(Switch.Changed, '#follow_redirects')
+    def follow_redirects_switch(self, message: Message):
+        self.state.set_value('follow_redirects', message.value)
+
     @on(Switch.Changed, '#autoping')
     def autoping_switch(self, message: Message):
         self.state.set_value('autoping', message.value)
@@ -927,6 +1042,9 @@ class WsApp(App):
     @on(AddressInput.Changed, '#address')
     def address_switch(self, message: Message):
         self.state.set_value('url', message.value)
+
+        if self.state.get_value('stick_url_to_text'):
+            self.state.get_current_text()['url'] = message.value
 
     @on(Switch.Changed, '#auto_reconnect')
     def auto_reconnect_switch(self, message: Message):
@@ -943,6 +1061,13 @@ class WsApp(App):
     @on(Switch.Changed, '#template_data')
     def template_data_switch(self, message: Message):
         self.state.set_value('template_data', message.value)
+
+    @on(Select.Changed, '#method')
+    def change_method(self, message: Message):
+        selected = message.value
+
+        if selected:
+            self.state.set_value('method', message.value)
 
     @on(Select.Changed, '#contexts_list')
     def change_context(self, message: Message):
@@ -966,14 +1091,21 @@ class WsApp(App):
         selected = message.value
 
         if selected and selected != Select.BLANK:
-            self.state.set_value('text_selected', selected)
-            self.state.set_value('text', self.state.get_value('texts')[selected])
+            if selected not in self.state.get_value('texts'):
+                text = self.state.get_current_text()
+            else:
+                text = self.state.get_value('texts')[selected]
+                self.state.set_value('text_selected', selected)
+            self.state.set_value('text', text['text'])
+            if self.state.get_value('stick_url_to_text'):
+                self.state.set_value('url', text['url'])
             self.refresh_fields()
 
     def compose_request_tab(self):
         yield MainGrid(
             ConnectContainer(
                 AddressInput(self.state.get_value('url'), placeholder='URL', id='address'),
+                Select([(x, x) for x in HTTP_METHODS], id='method', prompt='Method', value='WS', allow_blank=False),
                 Button('Connect', id='connect')
             ),
             Horizontal(
@@ -982,10 +1114,10 @@ class WsApp(App):
             ),
             WsRichLog(highlight=True, markup=True, id='ws_sessions_log'),
             HorizontalHAuto(
-                Select([('', '')], id='texts'),
-                Button('Add', id='add_text'),
-                Button('Delete', id='delete_text'),
-                Button('Edit', id='edit_text')
+                Select([('', '')], id='texts', prompt='Text', allow_blank=False),
+                NarrowButton('Add', id='add_text'),
+                NarrowButton('Delete', id='delete_text'),
+                NarrowButton('Edit', id='edit_text')
             ),
             SendTextArea(''),
             HorizontalHAuto(
@@ -999,57 +1131,69 @@ class WsApp(App):
             Label('Headers'),
             HorizontalHAuto(
                 OptionList(id='headers_list'),
-                Button('Add', id='add_header'),
-                Button('Delete', id='delete_header'),
-                Button('Edit', id='edit_header'),
+                NarrowButton('Add', id='add_header'),
+                NarrowButton('Delete', id='delete_header'),
+                NarrowButton('Edit', id='edit_header'),
             ),
-            HorizontalHAuto(
-                Label('\nAuto ping:'),
+            SwitchContainer(
+                Label('\nShow headers (not for WS):'),
+                Switch(self.state.get_value('show_headers'), animate=True, id='show_headers')
+            ),
+            SwitchContainer(
+                Label('\nStick url to text:'),
+                Switch(self.state.get_value('stick_url_to_text'), animate=True, id='stick_url_to_text')
+            ),
+            SwitchContainer(
+                Label('\nFollow redirects (not for WS):'),
+                Switch(self.state.get_value('follow_redirects'), animate=True, id='follow_redirects')
+            ),
+            SwitchContainer(
+                Label('\nAuto ping (WS only):'),
                 Switch(self.state.get_value('autoping'), animate=True, id='autoping')
             ),
-            HorizontalHAuto(
-                Label('\nAuto reconnect:'),
+            SwitchContainer(
+                Label('\nAuto reconnect (WS only):'),
                 Switch(self.state.get_value('auto_reconnect'), animate=True, id='auto_reconnect')
             ),
-            HorizontalHAuto(
+            SwitchContainer(
                 Label('\nCheck SSL:'),
                 Switch(self.state.get_value('ssl_check'), animate=True, id='ssl_check')
             ),
-            HorizontalHAuto(
+            SwitchContainer(
                 Label('\nUse Temlate for the url:'),
                 Switch(self.state.get_value('template_url'), animate=True, id='template_url')
             ),
-            HorizontalHAuto(
+            SwitchContainer(
                 Label('\nUse templates for the data being sent.:'),
                 Switch(self.state.get_value('template_data'), animate=True, id='template_data')
             ),
             Label('Configurations'),
             HorizontalHAuto(
-                Select([('', '')], id='configurations_list'),
-                Button('Add', id='add_configuration'),
-                Button('Delete', id='delete_configuration'),
-                Button('Edit', id='edit_configuration'),
+                Select([('', '')], id='configurations_list', prompt='Configuration', allow_blank=False),
+                NarrowButton('Add', id='add_configuration'),
+                NarrowButton('Delete', id='delete_configuration'),
+                NarrowButton('Edit', id='edit_configuration'),
             ),
             Label('Contexts'),
             HorizontalHAuto(
-                Select([('', '')], id='contexts_list'),
-                Button('Add', id='add_context'),
-                Button('Delete', id='delete_context'),
-                Button('Edit', id='edit_context'),
+                Select([('', '')], id='contexts_list', prompt='Context', allow_blank=False),
+                NarrowButton('Add', id='add_context'),
+                NarrowButton('Delete', id='delete_context'),
+                NarrowButton('Edit', id='edit_context'),
             ),
             Label('Context Variables (overrides global variables)'),
             HorizontalHAuto(
                 OptionList(id='context_variables'),
-                Button('Add', id='add_context_variable'),
-                Button('Delete', id='delete_context_variable'),
-                Button('Edit', id='edit_context_variable'),
+                NarrowButton('Add', id='add_context_variable'),
+                NarrowButton('Delete', id='delete_context_variable'),
+                NarrowButton('Edit', id='edit_context_variable'),
             ),
             Label('Global Variables'),
             HorizontalHAuto(
                 OptionList(id='global_variables'),
-                Button('Add', id='add_global_variable'),
-                Button('Delete', id='delete_global_variable'),
-                Button('Edit', id='edit_global_variable'),
+                NarrowButton('Add', id='add_global_variable'),
+                NarrowButton('Delete', id='delete_global_variable'),
+                NarrowButton('Edit', id='edit_global_variable'),
             ),
         )
 
