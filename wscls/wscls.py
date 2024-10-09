@@ -3,10 +3,12 @@ import os
 import asyncio
 import json
 import shutil
+from copy import deepcopy
 from time import time
 from typing import Any
 import tempfile
 from string import Template
+from collections import namedtuple
 
 import aiohttp
 from aiohttp.http_websocket import WSMessage
@@ -137,6 +139,7 @@ class State:
     @property
     def default_configuration(self):
         return {
+            'filename': '',
             'url': '',
             'method': 'WS',
             'headers': {},
@@ -153,7 +156,8 @@ class State:
     def default_text(self):
         return {
             'text': '',
-            'url': ''
+            'url': '',
+            'method': 'WS'
         }
 
     def get_configuration(self):
@@ -162,6 +166,32 @@ class State:
         except KeyError:
             self.configuration_name = list(self.configurations.keys())[0]
             return self.configurations[self.configuration_name]
+
+    def export_configuration(self, name, filename):
+        try:
+            with open(filename, 'w') as fil:
+                config = deepcopy(self.configurations[name])
+                config.pop('filename', None)
+                json.dump(config, fil)
+            return False
+        except Exception as exc:
+            return str(exc)
+
+    def load_configuration_from_file(self, app, name, filename):
+        config = self.configurations.get(name, self.default_configuration)
+
+        try:
+            with open(filename, 'r', encoding='utf8') as config_filename:
+                config.update(json.load(config_filename))
+                config['filename'] = filename
+        except Exception as exc:
+            app.notify(
+                f'Error loading configuration from file: {exc}',
+                title='Error',
+                severity='error'
+            )
+        self.configurations[name] = config
+
 
     def get_context(self):
         try:
@@ -221,31 +251,61 @@ class State:
             if self.context_name == name:
                 self.context_name = list(self.contexts.keys())[0]
 
-    def load(self):
+    def load(self, app):
         if not os.path.exists(self.state_filename):
             self.loaded = True
             return
         try:
             with open(self.state_filename, 'r', encoding='utf8') as fil:
                 state_file = json.load(fil)
-                self.configurations = state_file.get('configurations', self.configurations)
                 self.globals = state_file.get('globals', self.globals)
                 self.configuration_name = state_file.get('selected_configuration', 'default')
                 self.contexts = state_file.get('contexts', self.contexts)
                 self.context_name = state_file.get('selected_context', 'default')
                 self.loaded = True
+
+                for key, config in state_file.get('configurations', self.configurations).items():
+                    if config.get('filename'):
+                        self.load_configuration_from_file(app, key, config['filename'])
+                        continue
+
+                    self.configurations[key] = config
+
         except Exception as exc:
-            print(exc)
+            app.notify(f'Error loading state: {exc}', title='Error', severity='error')
 
     def save(self):
+        new_configurations = {}
         state_data = {
-            'configurations': self.configurations,
             'selected_configuration': self.configuration_name,
             'globals': self.globals,
             'contexts': self.contexts,
             'selected_context': self.context_name
 
         }
+
+        for key, config in self.configurations.items():
+            if config.get('filename'):
+                try:
+                    config_to_save = deepcopy(config)
+                    config_to_save.pop('filename', None)
+
+                    with tempfile.NamedTemporaryFile(mode="w", buffering=1) as fil:
+                        fil.write(json.dumps(config_to_save))
+                        fil.flush()
+                        shutil.copy(fil.name, config['filename'])
+                except Exception as exc:
+                    print(exc)
+
+                new_configurations[key] = {
+                    'filename': config['filename'],
+                }
+                continue
+
+            new_configurations[key] = config
+
+        state_data['configurations'] = new_configurations
+
         if self.loaded:
             with tempfile.NamedTemporaryFile(mode="w", buffering=1) as fil:
                 fil.write(json.dumps(state_data))
@@ -255,9 +315,9 @@ class State:
 
 class WsRichLog(RichLog):
     BINDINGS = [
-        Binding('s', 'toggle_scroll'),
-        Binding('c', 'clear'),
-        Binding('w', 'toggle_wrap'),
+        Binding('s', 'toggle_scroll', 'Toggle auto scroll'),
+        Binding('c', 'clear', 'Clear log'),
+        Binding('w', 'toggle_wrap', 'Toggle word wrap'),
     ]
 
     def action_toggle_wrap(self):
@@ -274,25 +334,183 @@ class WsRichLog(RichLog):
         self.app.query_one('#log_status').auto_scroll = self.auto_scroll
 
 
-class EditNameModalScreen(ModalScreen):
+class SingleInputModalScreen(ModalScreen):
     CSS = """
-        EditNameModalScreen {
+        SingleInputModalScreen {
             align: center middle;
         }
-        EditNameModalScreen > Vertical {
+        SingleInputModalScreen > Vertical {
             background: #101030;
             border: tall #303040;
             height: 12;
             width: 70;
         }
-        EditNameModalScreen #content {
+        SingleInputModalScreen #content {
             margin: 0 1;
         }
-        EditNameModalScreen Label {
+        SingleInputModalScreen Label {
             margin: 0 1;
         }
-        EditNameModalScreen #buttons {
+        SingleInputModalScreen #buttons {
             margin: 0 1;
+            align: center bottom;
+        }
+    """
+    def __init__(self, title, input1=None, input_placeholder='Name') -> None:
+        self.input1 = input1
+        self.modal_title = title
+        self.input_placeholder = input_placeholder
+        self.result_type = namedtuple('SingleInputResult', ['input1'])
+        super().__init__()
+
+    @on(Button.Pressed, '#add')
+    def add(self, message: Message):
+        self.dismiss(self.result_type(self.query_one('#text_name').value))
+
+    @on(Button.Pressed, '#save')
+    def save(self, message: Message):
+        self.dismiss(self.result_type(self.query_one('#text_name').value))
+
+    @on(Button.Pressed, '#cancel')
+    def cancel(self, message: Message):
+        self.dismiss(None)
+
+    @on(Input.Submitted)
+    def submit(self, message: Message):
+        self.dismiss(self.result_type(self.query_one('#text_name').value))
+
+    def on_key(self, event: Event):
+        if event.key == 'escape':
+            self.dismiss(None)
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            with Vertical(id='content'):
+                yield Label(self.modal_title)
+                yield Input(placeholder=self.input_placeholder, id='text_name', value=self.input1)
+
+                if self.input1:
+                    yield Horizontal(
+                        Button('Save', id='save'),
+                        Button('Cancel', id='cancel'),
+                        id='buttons'
+                    )
+                else:
+                    yield Horizontal(
+                        Button('Add', id='add'),
+                        Button('Cancel', id='cancel'),
+                        id='buttons'
+                    )
+
+
+class DoubleInputModalScreen(ModalScreen):
+    CSS = """
+        DoubleInputModalScreen {
+            align: center middle;
+        }
+        DoubleInputModalScreen > Vertical {
+            background: #101030;
+            border: tall #303040;
+            height: 12;
+            width: 70;
+        }
+        DoubleInputModalScreen #content {
+            margin: 0 1;
+        }
+        DoubleInputModalScreen Label {
+            margin: 0 1;
+        }
+        DoubleInputModalScreen #buttons {
+            margin: 0 1;
+            align: center bottom;
+        }
+    """
+    def __init__(self,
+            title,
+            input1=None,
+            input2=None,
+            input1_placeholder = 'Name',
+            input2_placeholder = 'Value'
+        ) -> None:
+        self.input1 = input1
+        self.input2 = input2
+        self.modal_title = title
+        self.input1_placeholder = input1_placeholder
+        self.input2_placeholder = input2_placeholder
+        self.result_type = namedtuple('DoubleInputResult', ['input1', 'input2'])
+        super().__init__()
+
+    @on(Button.Pressed, '#add')
+    def add(self, message: Message):
+        self.dismiss(
+            self.result_type(self.query_one('#imput_name').value, self.query_one('#input_value').value)
+        )
+
+    @on(Button.Pressed, '#save')
+    def save(self, message: Message):
+        self.dismiss(
+            self.result_type(self.query_one('#imput_name').value, self.query_one('#input_value').value)
+        )
+
+    @on(Button.Pressed, '#cancel')
+    def cancel(self, message: Message):
+        self.dismiss(None)
+
+    @on(Input.Submitted)
+    def submit(self, message: Message):
+        self.dismiss(
+            self.result_type(self.query_one('#imput_name').value, self.query_one('#input_value').value)
+        )
+
+    def on_key(self, event: Event):
+        if event.key == 'escape':
+            self.dismiss(None)
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            with Vertical(id='content'):
+                yield Label(self.modal_title)
+                yield Input(placeholder=self.input1_placeholder, id='imput_name', value=self.input1)
+                yield Input(placeholder=self.input2_placeholder, id='input_value', value=self.input2)
+
+                if self.input1:
+                    yield Horizontal(
+                        Button('Save', id='save'),
+                        Button('Cancel', id='cancel'),
+                        id='buttons'
+                    )
+                else:
+                    yield Horizontal(
+                        Button('Add', id='add'),
+                        Button('Cancel', id='cancel'),
+                        id='buttons'
+                    )
+
+
+class ConfirmScreen(ModalScreen):
+    CSS = """
+        ConfirmScreen {
+            align: center middle;
+        }
+        ConfirmScreen > Vertical {
+            background: #101030;
+            border: tall #303040;
+            height: 10;
+            width: 70;
+        }
+        ConfirmScreen #content {
+            margin: 0 1;
+        }
+        ConfirmScreen Label {
+            padding: 1 2;
+            height: 100%;
+            width: 100%;
+            color: auto;
+            text-align: center;
+        }
+        ConfirmScreen #buttons {
+            margin: 0 1;
+            align: center bottom;
         }
     """
     def __init__(self, title, name=None) -> None:
@@ -300,13 +518,9 @@ class EditNameModalScreen(ModalScreen):
         self.modal_title = title
         super().__init__()
 
-    @on(Button.Pressed, '#add')
-    def add(self, message: Message):
-        self.dismiss(self.query_one('#text_name').value)
-
-    @on(Button.Pressed, '#save')
-    def save(self, message: Message):
-        self.dismiss(self.query_one('#text_name').value)
+    @on(Button.Pressed, '#confirm')
+    def confirm(self, message: Message):
+        self.dismiss(True)
 
     @on(Button.Pressed, '#cancel')
     def cancel(self, message: Message):
@@ -314,7 +528,7 @@ class EditNameModalScreen(ModalScreen):
 
     @on(Input.Submitted)
     def submit(self, message: Message):
-        self.dismiss(self.query_one('#text_name').value)
+        self.dismiss(True)
 
     def on_key(self, event: Event):
         if event.key == 'escape':
@@ -323,89 +537,15 @@ class EditNameModalScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         with Vertical():
             with Vertical(id='content'):
-                yield Label(self.modal_title)
-                yield Input(placeholder='Name', id='text_name', value=self.key_name)
+                yield Horizontal(
+                    Label(self.modal_title)
+                )
 
-                if self.key_name:
-                    yield Horizontal(
-                        Button('Save', id='save'),
-                        Button('Cancel', id='cancel'),
-                        id='buttons'
-                    )
-                else:
-                    yield Horizontal(
-                        Button('Add', id='add'),
-                        Button('Cancel', id='cancel'),
-                        id='buttons'
-                    )
-
-
-class EditNameValueScreen(ModalScreen):
-    CSS = """
-        EditNameValueScreen {
-            align: center middle;
-        }
-        EditNameValueScreen > Vertical {
-            background: #101030;
-            border: tall #303040;
-            height: 12;
-            width: 70;
-        }
-        EditNameValueScreen #content {
-            margin: 0 1;
-        }
-        EditNameValueScreen Label {
-            margin: 0 1;
-        }
-        EditNameValueScreen #buttons {
-            margin: 0 1;
-        }
-    """
-    def __init__(self, title, name=None, value=None) -> None:
-        self.key_name = name
-        self.value = value
-        self.modal_title = title
-        super().__init__()
-
-    @on(Button.Pressed, '#add')
-    def add(self, message: Message):
-        self.dismiss((self.query_one('#imput_name').value, self.query_one('#input_value').value))
-
-    @on(Button.Pressed, '#save')
-    def save(self, message: Message):
-        self.dismiss((self.query_one('#imput_name').value, self.query_one('#input_value').value))
-
-    @on(Button.Pressed, '#cancel')
-    def cancel(self, message: Message):
-        self.dismiss(None)
-
-    @on(Input.Submitted)
-    def submit(self, message: Message):
-        self.dismiss((self.query_one('#imput_name').value, self.query_one('#input_value').value))
-
-    def on_key(self, event: Event):
-        if event.key == 'escape':
-            self.dismiss(None)
-
-    def compose(self) -> ComposeResult:
-        with Vertical():
-            with Vertical(id='content'):
-                yield Label(self.modal_title)
-                yield Input(placeholder='Name', id='imput_name', value=self.key_name)
-                yield Input(placeholder='Value', id='input_value', value=self.value)
-
-                if self.key_name:
-                    yield Horizontal(
-                        Button('Save', id='save'),
-                        Button('Cancel', id='cancel'),
-                        id='buttons'
-                    )
-                else:
-                    yield Horizontal(
-                        Button('Add', id='add'),
-                        Button('Cancel', id='cancel'),
-                        id='buttons'
-                    )
+                yield Horizontal(
+                    Button('Confirm', id='confirm'),
+                    Button('Cancel', id='cancel'),
+                    id='buttons'
+                )
 
 
 class AddressInput(Input):
@@ -521,7 +661,8 @@ class WsApp(App):
             log.write(f'[cyan]Request: {method} {url}')
             log.write(f'[cyan]Response: {resp.status}')
             if self.state.get_value('show_headers'):
-                log.write(f'[cyan]Headers:\n   {(chr(10) + "   ").join([f"{key}: {value}" for key, value in resp.headers.items()])}')
+                headers_text = ('\n   ').join([f"{key}: {value}" for key, value in resp.headers.items()])
+                log.write(f'[cyan]Headers:\n   {headers_text}')
             log.write(f'[cyan]Body: \n{await resp.text()}')
 
     async def connect(self):
@@ -579,9 +720,14 @@ class WsApp(App):
     @work
     @on(Button.Pressed, '#add_header')
     async def on_add_header_menu_button_message(self, message: Message):
-        key, _ = await self.edit_config_state_config_key_value('Add Header', 'headers')
-        if key:
-            self.refresh_headers()
+        val = await self.edit_config_state_config_key_value(
+            'headers',
+            modal=DoubleInputModalScreen('Add Header')
+        )
+        if not val:
+            return
+
+        self.refresh_headers()
 
     @work
     @on(Button.Pressed, '#edit_header')
@@ -596,24 +742,38 @@ class WsApp(App):
         if not selected.id:
             return
 
-        key, _ = await self.edit_config_state_config_key_value('Edit Header', 'headers', orig_key_name=selected.id)
+        input1 = selected.id
+        input2 = self.state.get_value('headers').get(input1, '')
 
-        if not key:
+        val = await self.edit_config_state_config_key_value(
+            'headers',
+            modal=DoubleInputModalScreen('Edit Header', input1=input1, input2=input2),
+            orig_key_name=selected.id
+        )
+
+        if not val:
             return
 
         self.refresh_headers()
 
+    @work
     @on(Button.Pressed, '#delete_header')
-    def delete_header(self, message: Message):
+    async def delete_header(self, message: Message):
         headers_list = self.query_one('#headers_list')
 
         if headers_list.highlighted is None:
             return
 
         selected = headers_list.get_option_at_index(headers_list.highlighted)
-        if selected:
-            del self.state.get_value('headers')[selected.id]
-            self.refresh_headers()
+
+        if not selected:
+            return
+
+        if not await self.confirm_request(f'Are you sure you want to delete header "{selected.id}" ?'):
+            return
+
+        del self.state.get_value('headers')[selected.id]
+        self.refresh_headers()
 
     def refresh_headers(self):
         headers_list = self.query_one('#headers_list')
@@ -627,9 +787,14 @@ class WsApp(App):
     @work
     @on(Button.Pressed, '#add_global_variable')
     async def on_add_global_variable_menu_button_message(self, message: Message):
-        key, _ = await self.edit_config_state_config_key_value('Add global variable', 'globals')
-        if key:
-            self.refresh_globals()
+        val= await self.edit_config_state_config_key_value(
+            'globals',
+            modal=DoubleInputModalScreen('Add Global Variable')
+        )
+        if not val:
+            return
+
+        self.refresh_globals()
 
     @work
     @on(Button.Pressed, '#edit_global_variable')
@@ -644,24 +809,38 @@ class WsApp(App):
         if not selected.id:
             return
 
-        key, _ = await self.edit_config_state_config_key_value('Edit Global Variable', 'globals', orig_key_name=selected.id)
+        input1 = selected.id
+        input2 = self.state.get_value('globals').get(input1, '')
 
-        if not key:
+        val = await self.edit_config_state_config_key_value(
+            'globals',
+            modal=DoubleInputModalScreen('Edit Global Variable', input1=input1, input2=input2),
+            orig_key_name=selected.id
+        )
+
+        if not val:
             return
 
         self.refresh_globals()
 
+    @work
     @on(Button.Pressed, '#delete_global_variable')
-    def delete_global_variable(self, message: Message):
+    async def delete_global_variable(self, message: Message):
         headers_list = self.query_one('#global_variables')
 
         if headers_list.highlighted is None:
             return
 
         selected = headers_list.get_option_at_index(headers_list.highlighted)
-        if selected:
-            del self.state.get_value('globals')[selected.id]
-            self.refresh_globals()
+
+        if not selected:
+            return
+
+        if not await self.confirm_request(f'Are you sure you want to delete global variable "{selected.id}"?'):
+            return
+
+        del self.state.get_value('globals')[selected.id]
+        self.refresh_globals()
 
     def refresh_globals(self):
         globals_list = self.query_one('#global_variables')
@@ -674,39 +853,51 @@ class WsApp(App):
     @work
     @on(Button.Pressed, '#add_context')
     async def on_add_context(self, message: Message):
-        name = await self.edit_config_state_config_key(
-            'Add Context',
+        val = await self.edit_config_state_config_key(
             'contexts',
+            modal=SingleInputModalScreen('Add Context'),
             default_value=self.state.default_context
         )
 
-        if name:
-            self.refresh_contexts()
+        if not val:
+            return
+
+        self.refresh_contexts()
 
     @work
     @on(Button.Pressed, '#edit_context')
     async def on_edit_context(self, message: Message):
         orig_name = self.state.context_name
 
-        name = await self.edit_config_state_config_key(
-            'Edit Context',
+        val = await self.edit_config_state_config_key(
             'contexts',
+            modal=SingleInputModalScreen('Edit Context', input1=orig_name),
             orig_key_name=orig_name
         )
 
-        if name:
-            self.state.context_name = name
-            self.refresh_contexts()
+        if not val:
+            return
 
+        self.state.context_name = val.input1
+        self.refresh_contexts()
+
+    @work
     @on(Button.Pressed, '#delete_context')
-    def delete_context(self, message: Message):
+    async def delete_context(self, message: Message):
         config_list = self.query_one('#contexts_list')
         selected = config_list.value
-        if selected:
-            self.state.delete_context(selected)
-            self.state.context_name = list(self.state.contexts.keys())[0]
-            self.refresh_fields()
-            self.refresh_contexts()
+
+        if not selected:
+            return
+
+        if not await self.confirm_request(f'Are you sure you want to delete context "{selected}"?'):
+            return
+
+
+        self.state.delete_context(selected)
+        self.state.context_name = list(self.state.contexts.keys())[0]
+        self.refresh_fields()
+        self.refresh_contexts()
 
     def refresh_contexts(self):
         config_list = self.query_one('#contexts_list')
@@ -717,9 +908,14 @@ class WsApp(App):
     @work
     @on(Button.Pressed, '#add_context_variable')
     async def on_add_context_variable_menu_button_message(self, message: Message):
-        key, _ = await self.edit_config_state_config_key_value('Add context variable', 'context_variables')
-        if key:
-            self.refresh_context_variables()
+        val = await self.edit_config_state_config_key_value(
+            'context_variables',
+            modal=DoubleInputModalScreen('Add Context Variable')
+        )
+        if not val:
+            return
+
+        self.refresh_context_variables()
 
     @work
     @on(Button.Pressed, '#edit_context_variable')
@@ -734,28 +930,37 @@ class WsApp(App):
         if not selected.id:
             return
 
-        key, _ = await self.edit_config_state_config_key_value(
-            'Edit context Variable',
+        input1 = selected.id
+        input2 = self.state.get_value('context_variables').get(input1, '')
+
+        val = await self.edit_config_state_config_key_value(
             'context_variables',
+            modal=DoubleInputModalScreen('Edit Context Variable', input1=input1, input2=input2),
             orig_key_name=selected.id
         )
 
-        if not key:
+        if not val:
             return
 
         self.refresh_context_variables()
 
+    @work
     @on(Button.Pressed, '#delete_context_variable')
-    def delete_context_variable(self, message: Message):
+    async def delete_context_variable(self, message: Message):
         headers_list = self.query_one('#context_variables')
 
         if headers_list.highlighted is None:
             return
 
         selected = headers_list.get_option_at_index(headers_list.highlighted)
-        if selected:
-            del self.state.get_value('context_variables')[selected.id]
-            self.refresh_context_variables()
+        if not selected:
+            return
+
+        if not await self.confirm_request(f'Are you sure you want to delete context variable "{selected.id}"?'):
+            return
+
+        del self.state.get_value('context_variables')[selected.id]
+        self.refresh_context_variables()
 
     def refresh_context_variables(self):
         globals_list = self.query_one('#context_variables')
@@ -769,7 +974,14 @@ class WsApp(App):
     @work
     @on(Button.Pressed, '#add_text')
     async def on_add_text_select_item(self, message: Message):
-        await self.edit_config_state_config_key('Add Text', 'texts', default_value=self.state.default_text)
+        val = await self.edit_config_state_config_key(
+            'texts',
+            modal=SingleInputModalScreen('Add Text'),
+            default_value=self.state.default_text
+        )
+
+        if not val:
+            return
 
         self.refresh_texts()
 
@@ -782,22 +994,30 @@ class WsApp(App):
         if selected is None:
             return
 
-        new_name = await self.edit_config_state_config_key('Edit Text', 'texts', orig_key_name=selected)
+        val = await self.edit_config_state_config_key(
+            'texts',
+            modal=SingleInputModalScreen('Edit Text', input1=selected),
+            orig_key_name=selected
+        )
 
-        if not new_name:
+        if not val:
             return
 
-        self.state.set_value('text_selected', new_name)
+        self.state.set_value('text_selected', val.input1)
 
         self.refresh_texts()
 
+    @work
     @on(Button.Pressed, '#delete_text')
-    def delete_text(self, message: Message):
+    async def delete_text(self, message: Message):
         texts_list = self.query_one('#texts')
 
         selected = texts_list.value
 
         if selected is None:
+            return
+
+        if not await self.confirm_request(f'Are you sure you want to delete text "{selected}"?'):
             return
 
         self.state.get_value('texts').pop(selected)
@@ -817,39 +1037,110 @@ class WsApp(App):
     @work
     @on(Button.Pressed, '#add_configuration')
     async def on_add_configuration(self, message: Message):
-        name = await self.edit_config_state_config_key(
+        modal = DoubleInputModalScreen(
             'Add Configuration',
-            'configurations',
-            default_value=self.state.default_configuration
+            input1_placeholder='Name',
+            input2_placeholder='External filename (optional)'
         )
 
-        if name:
-            self.refresh_configurations()
+        value = self.state.default_configuration
+
+        val = await self.edit_config_state_config_key(
+            'configurations',
+            modal=modal,
+            default_value=value,
+        )
+
+        if not val:
+            return
+
+        if val.input2:
+            self.state.load_configuration_from_file(self, val.input1, val.input2)
+
+        self.refresh_configurations()
 
     @work
     @on(Button.Pressed, '#edit_configuration')
     async def on_edit_configuration(self, message: Message):
         orig_name = self.state.configuration_name
 
-        name = await self.edit_config_state_config_key(
+        input2 = self.state.get_value('configurations').get(orig_name, {}).get('filename', '')
+
+        modal = DoubleInputModalScreen(
             'Edit Configuration',
+            input1=orig_name,
+            input2=input2,
+            input1_placeholder='Name',
+            input2_placeholder='Outsource filename (optional)'
+        )
+
+        val = await self.edit_config_state_config_key(
             'configurations',
+            modal=modal,
             orig_key_name=orig_name
         )
 
-        if name:
-            self.state.configuration_name = name
-            self.refresh_configurations()
+        if not val:
+            return
 
+        if val.input2:
+            if input2 != val.input2 and os.path.exists(input2):
+                if not await self.confirm_request(
+                    f'File "{val.input2}" already exists. Are you sure you want to update filename?'
+                ):
+                    return
+
+            self.state.get_value('configurations')[val.input1]['filename'] = val.input2
+
+        self.refresh_configurations()
+
+    @work
+    @on(Button.Pressed, '#export_configuration')
+    async def on_export_configuration(self, message: Message):
+        config_name = self.state.configuration_name
+
+        modal = SingleInputModalScreen(
+            'Export Configuration',
+            input_placeholder='Filename to export to',
+        )
+
+        val = await self.push_screen_wait(
+            modal
+        )
+
+        if not val:
+            return
+
+        if os.path.exists(val.input1):
+            if not await self.confirm_request(f'File "{val.input1}" already exists. Overwrite?'):
+                return
+
+        export_err = self.state.export_configuration(config_name, val.input1)
+
+        if not export_err:
+            self.notify(f'Configuration "{config_name}" exported to "{val.input1}"', title='Exported')
+        else:
+            self.notify(
+                f'Error exporting configuration "{config_name}" to "{val.input1}" {export_err}',
+                title='Error',
+                severity='error'
+            )
+
+    @work
     @on(Button.Pressed, '#delete_configuration')
-    def delete_configuration(self, message: Message):
+    async def delete_configuration(self, message: Message):
         config_list = self.query_one('#configurations_list')
         selected = config_list.value
-        if selected:
-            self.state.delete_configuration(selected)
-            self.state.configuration_name = list(self.state.configurations.keys())[0]
-            self.refresh_fields()
-            self.refresh_configurations()
+        if not selected:
+            return
+
+        if not await self.confirm_request(f'Are you sure you want to delete configuration "{selected}"?'):
+            return
+
+        self.state.delete_configuration(selected)
+        self.state.configuration_name = list(self.state.configurations.keys())[0]
+        self.refresh_fields()
+        self.refresh_configurations()
 
     def refresh_configurations(self):
         config_list = self.query_one('#configurations_list')
@@ -857,6 +1148,7 @@ class WsApp(App):
         config_list.value = self.state.configuration_name
 
     def on_mount(self):
+        self.state.load(self)
         self.refresh_fields()
         self.refresh_configurations()
         self.refresh_texts()
@@ -867,7 +1159,6 @@ class WsApp(App):
         addr = self.query_one(AddressInput).value
 
         if self.state.get_value('template_url'):
-            vars = self.state.get_variables()
             addr = render_template(addr, self.state.get_variables())
 
         if self._connect_task:
@@ -919,17 +1210,21 @@ class WsApp(App):
         if self.state.get_value('method') != 'WS':
             self.query_one('#connect').action_press()
 
-    async def get_key_from_modal(self, title: str, name: str = None) -> str:
-        screen = EditNameModalScreen(title, name=name)
-
-        data = await self.push_screen_wait(
-            screen
+    async def get_key_value_from_modal(
+        self,
+        title: str,
+        name: str = None,
+        value: str = None,
+        input1_placeholder = 'Name',
+        input2_placeholder = 'Value'
+    ) -> str:
+        screen = DoubleInputModalScreen(
+            title,
+            name=name,
+            value=value,
+            input1_placeholder=input1_placeholder,
+            input2_placeholder=input2_placeholder
         )
-
-        return data
-
-    async def get_key_value_from_modal(self, title: str, name: str = None, value: str = None) -> str:
-        screen = EditNameValueScreen(title, name=name, value=value)
 
         data = await self.push_screen_wait(
             screen
@@ -942,42 +1237,53 @@ class WsApp(App):
 
     async def edit_config_state_config_key(
             self,
-            modal_title: str,
             section: str,
+            modal = None,
             orig_key_name: str = None,
             default_value: str = ''
         ) -> None|str:
 
-        data = await self.get_key_from_modal(modal_title, name=orig_key_name)
+        data = await self.push_screen_wait(
+            modal
+        )
 
         if data is None:
             return
 
         if orig_key_name is None:
-            if self.state.get_value(section) and data in self.state.get_value(section):
+            if self.state.get_value(section) and data.input1 in self.state.get_value(section):
                 # unable to create as record already exists
                 return
-            self.state.get_value(section)[data] = default_value
+            self.state.get_value(section)[data.input1] = default_value
             return data
 
-        if orig_key_name and data == orig_key_name:
+        if orig_key_name and data.input1 == orig_key_name:
             return data
 
         if (orig_key_name and
-            orig_key_name != data and
+            orig_key_name != data.input1 and
             self.state.get_value(section) and
-            data in self.state.get_value(section)
+            data.input1 in self.state.get_value(section)
         ):
             # unable to rename as record already exists
             return
 
-        self.state.get_value(section)[data] = self.state.get_value(section).pop(orig_key_name)
+        self.state.get_value(section)[data.input1] = self.state.get_value(section).pop(orig_key_name)
+        return data
+
+    async def confirm_request(self, title: str) -> bool:
+        screen = ConfirmScreen(title)
+
+        data = await self.push_screen_wait(
+            screen
+        )
+
         return data
 
     async def edit_config_state_config_key_value(
             self,
-            modal_title: str,
             section: str,
+            modal = None,
             orig_key_name: str = None
         ) -> None|str:
 
@@ -985,33 +1291,31 @@ class WsApp(App):
         if orig_key_name:
             value = self.state.get_value(section).get(orig_key_name, '')
 
-        key, value = await self.get_key_value_from_modal(modal_title, name=orig_key_name, value=value)
+        val = await self.push_screen_wait(
+            modal
+        )
 
-        if key is None:
-            return (None, None)
+        if not val:
+            return None
 
         if orig_key_name is None:
-            if self.state.get_value(section) and key in self.state.get_value(section):
+            if self.state.get_value(section) and val.input1 in self.state.get_value(section):
                 # unable to create as record already exists
                 return (None, None)
-            self.state.get_value(section)[key] = value
-            return (key, value)
+            self.state.get_value(section)[val.input1] = val.input2
+            return val
 
         if (orig_key_name and
-            orig_key_name != key and
+            orig_key_name != val.input1 and
             self.state.get_value(section) and
-            key in self.state.get_value(section)
+            val.input1 in self.state.get_value(section)
         ):
             # unable to rename as record already exists
             return (None, None)
 
         self.state.get_value(section).pop(orig_key_name)
-        self.state.get_value(section)[key] = value
-        return (key, value)
-
-    @on(AddressInput.Submitted)
-    def submit_connect(self, message: Message):
-        self.query_one('#connect').action_press()
+        self.state.get_value(section)[val.input1] = value
+        return val
 
     @on(Button.Pressed, '#ping')
     async def ping(self):
@@ -1029,6 +1333,10 @@ class WsApp(App):
 
     @on(Switch.Changed, '#stick_url_to_text')
     def stick_url_to_text_switch(self, message: Message):
+        if message.value:
+            for text in self.state.get_value('texts').values():
+                text['url'] = self.state.get_value('url')
+                text['method'] = self.state.get_value('method')
         self.state.set_value('stick_url_to_text', message.value)
 
     @on(Switch.Changed, '#follow_redirects')
@@ -1040,7 +1348,7 @@ class WsApp(App):
         self.state.set_value('autoping', message.value)
 
     @on(AddressInput.Changed, '#address')
-    def address_switch(self, message: Message):
+    def address_change(self, message: Message):
         self.state.set_value('url', message.value)
 
         if self.state.get_value('stick_url_to_text'):
@@ -1064,10 +1372,10 @@ class WsApp(App):
 
     @on(Select.Changed, '#method')
     def change_method(self, message: Message):
-        selected = message.value
+        self.state.set_value('method', message.value)
 
-        if selected:
-            self.state.set_value('method', message.value)
+        if self.state.get_value('stick_url_to_text'):
+            self.state.get_current_text()['method'] = message.value
 
     @on(Select.Changed, '#contexts_list')
     def change_context(self, message: Message):
@@ -1099,6 +1407,7 @@ class WsApp(App):
             self.state.set_value('text', text['text'])
             if self.state.get_value('stick_url_to_text'):
                 self.state.set_value('url', text['url'])
+                self.state.set_value('method', text.get('method', 'WS'))
             self.refresh_fields()
 
     def compose_request_tab(self):
@@ -1173,6 +1482,7 @@ class WsApp(App):
                 NarrowButton('Add', id='add_configuration'),
                 NarrowButton('Delete', id='delete_configuration'),
                 NarrowButton('Edit', id='edit_configuration'),
+                NarrowButton('Export', id='export_configuration'),
             ),
             Label('Contexts'),
             HorizontalHAuto(
@@ -1217,7 +1527,6 @@ def main():
         args = parser.parse_args()
 
         state = State(args.config_path)
-        state.load()
         app = WsApp(state)
         app.run()
     finally:
