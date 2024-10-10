@@ -25,6 +25,8 @@ from textual.widgets import Label
 from textual.widgets import TabbedContent
 from textual.widgets import TabPane
 from textual.widgets import Switch
+from textual.widgets._select import SelectCurrent
+from textual.widgets._select import SelectOverlay
 from textual.widget import Widget
 from textual.widgets import Footer
 from textual.containers import Horizontal
@@ -113,11 +115,50 @@ def render_template(template: str, variables: dict) -> str:
     return Template(template).safe_substitute(variables)
 
 
+class SelectSearchable(Select):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._search_str = ''
+
+    def on_key(self, event: Event):
+        if self._search_str == self.value:
+            self._search_str = ''
+
+        if event.key == 'space':
+            self._search_str += ' '
+        elif event.is_printable:
+            self._search_str += event.key
+        elif event.key == 'backspace':
+            self._search_str = self._search_str[:-1]
+        else:
+            return
+
+        self.query_one(SelectCurrent).update(self._search_str)
+
+        options_list = self.query_one(SelectOverlay)
+
+        for idx, (key, val) in enumerate(self._options):
+            options_list.enable_option_at_index(idx)
+
+            if val and self._search_str.lower() not in val.lower():
+                options_list.disable_option_at_index(idx)
+
+    def _watch_expanded(self, expanded: bool) -> None:
+        super()._watch_expanded(expanded=expanded)
+        self._search_str = self.value
+        self.query_one(SelectCurrent).update(self._search_str)
+
+        if not expanded:
+            for idx in range(len(self._options)):
+                self.query_one(SelectOverlay).enable_option_at_index(idx)
+
+
 class State:
     def __init__(self, filename: str = None):
         if not filename:
             filename = os.path.join(os.path.expanduser("~"), '.wscls.json')
         self.configuration_name = 'default'
+        self.files_mtime = {}
         self.state_filename = filename
 
         self.configurations = {
@@ -182,6 +223,7 @@ class State:
 
         try:
             with open(filename, 'r', encoding='utf8') as config_filename:
+                self.files_mtime[filename] = os.path.getmtime(filename)
                 config.update(json.load(config_filename))
                 config['filename'] = filename
         except Exception as exc:
@@ -257,6 +299,7 @@ class State:
             return
         try:
             with open(self.state_filename, 'r', encoding='utf8') as fil:
+                self.files_mtime[self.state_filename] = os.path.getmtime(self.state_filename)
                 state_file = json.load(fil)
                 self.globals = state_file.get('globals', self.globals)
                 self.configuration_name = state_file.get('selected_configuration', 'default')
@@ -274,7 +317,7 @@ class State:
         except Exception as exc:
             app.notify(f'Error loading state: {exc}', title='Error', severity='error')
 
-    def save(self):
+    async def save(self, app):
         new_configurations = {}
         state_data = {
             'selected_configuration': self.configuration_name,
@@ -284,15 +327,31 @@ class State:
 
         }
 
+        if not self.loaded:
+            return
+
         for key, config in self.configurations.items():
             if config.get('filename'):
                 try:
                     config_to_save = deepcopy(config)
                     config_to_save.pop('filename', None)
 
+                    if self.files_mtime.get(config['filename']) != os.path.getmtime(config['filename']):
+                        result = await app.confirm_request(
+                            f'File "{config["filename"]}" has been modified. Do you want to overwrite it?',
+                            with_no_button=True
+                        )
+
+                        if result is None:
+                            return
+
+                        if not result:
+                            continue
+
                     with tempfile.NamedTemporaryFile(mode="w", buffering=1) as fil:
                         fil.write(json.dumps(config_to_save))
                         fil.flush()
+
                         shutil.copy(fil.name, config['filename'])
                 except Exception as exc:
                     print(exc)
@@ -306,11 +365,24 @@ class State:
 
         state_data['configurations'] = new_configurations
 
-        if self.loaded:
-            with tempfile.NamedTemporaryFile(mode="w", buffering=1) as fil:
-                fil.write(json.dumps(state_data))
-                fil.flush()
-                shutil.copy(fil.name, self.state_filename)
+        if self.files_mtime.get(self.state_filename) != os.path.getmtime(self.state_filename):
+            result = await app.confirm_request(
+                f'File "{self.state_filename}" has been modified. Do you want to overwrite it?',
+                with_no_button=True
+            )
+
+            if result is None:
+                return
+
+            if not result:
+                return True
+
+        with tempfile.NamedTemporaryFile(mode="w", buffering=1) as fil:
+            fil.write(json.dumps(state_data))
+            fil.flush()
+            shutil.copy(fil.name, self.state_filename)
+
+        return True
 
 
 class WsRichLog(RichLog):
@@ -513,9 +585,10 @@ class ConfirmScreen(ModalScreen):
             align: center bottom;
         }
     """
-    def __init__(self, title, name=None) -> None:
+    def __init__(self, title, name=None, with_no_button=False) -> None:
         self.key_name = name
         self.modal_title = title
+        self.with_no_button = with_no_button
         super().__init__()
 
     @on(Button.Pressed, '#confirm')
@@ -525,6 +598,10 @@ class ConfirmScreen(ModalScreen):
     @on(Button.Pressed, '#cancel')
     def cancel(self, message: Message):
         self.dismiss(None)
+
+    @on(Button.Pressed, '#no')
+    def no(self, message: Message):
+        self.dismiss(False)
 
     @on(Input.Submitted)
     def submit(self, message: Message):
@@ -540,12 +617,11 @@ class ConfirmScreen(ModalScreen):
                 yield Horizontal(
                     Label(self.modal_title)
                 )
-
-                yield Horizontal(
-                    Button('Confirm', id='confirm'),
-                    Button('Cancel', id='cancel'),
-                    id='buttons'
-                )
+                with Horizontal(id='buttons'):
+                    yield Button('Yes', id='confirm')
+                    if self.with_no_button:
+                        yield Button('No', id='no')
+                    yield Button('Cancel', id='cancel')
 
 
 class AddressInput(Input):
@@ -585,17 +661,23 @@ class WsApp(App):
         self._ws = None
         self._connecting_params = None
         self.state = state
+        self.status_label = None
+        self.log_field = None
+
+    @work
+    async def action_quit(self):
+        save_result = await self.state.save(self)
+        if save_result:
+            self.exit()
 
     async def process_incomming_ws_message(self, log: RichLog, msg: WSMessage):
-        log = self.query_one('#ws_sessions_log')
-
         if msg.type == aiohttp.WSMsgType.ERROR:
-            log.write('[red]Error: ')
+            self.log_field.write('[red]Error: ')
         elif msg.type == aiohttp.WSMsgType.PONG:
             rtt = round((time() - float(msg.data.decode('utf-8'))) * 1000, 3)
-            log.write(f'[cyan]Pong received, RTT: {rtt} ms')
+            self.log_field.write(f'[cyan]Pong received, RTT: {rtt} ms')
         else:
-            log.write(f'[cyan]Received: {msg.data}')
+            self.log_field.write(f'[cyan]Received: {msg.data}')
 
     def on_connected(self, log: RichLog, url: str):
         text = f'[green]Connected to: {url}'
@@ -666,7 +748,6 @@ class WsApp(App):
             log.write(f'[cyan]Body: \n{await resp.text()}')
 
     async def connect(self):
-        log = self.query_one('#ws_sessions_log')
         while True:
             if not self._connecting_params:
                 break
@@ -674,11 +755,11 @@ class WsApp(App):
             try:
                 async with aiohttp.ClientSession(raise_for_status=True) as session:
                     if self._connecting_params['method'] == 'WS':
-                        await self.connect_ws(session, log)
+                        await self.connect_ws(session, self.log_field)
                     else:
-                        await self.connect_http(session, log)
+                        await self.connect_http(session, self.log_field)
             except Exception as exc:
-                log.write(f'[red]Error: {exc}')
+                self.log_field.write(f'[red]Error: {exc}')
 
             if not self.state.get_value('auto_reconnect') or self._connecting_params['method'] != 'WS':
                 button = self.query_one('#connect')
@@ -692,7 +773,7 @@ class WsApp(App):
             if not self._connecting_params:
                 break
 
-            log.write(f'[yellow]Reconnecting to: {self._connecting_params["url"]}')
+            self.log_field.write(f'[yellow]Reconnecting to: {self._connecting_params["url"]}')
 
     def refresh_fields(self):
         self.query_one(AddressInput).value = self.state.get_value('url')
@@ -901,7 +982,7 @@ class WsApp(App):
 
     def refresh_contexts(self):
         config_list = self.query_one('#contexts_list')
-        config_list.set_options([(x, x) for x in self.state.contexts.keys()])
+        config_list.set_options([(x, x) for x in sorted(self.state.contexts.keys())])
         config_list.value = self.state.context_name
 
 
@@ -1028,7 +1109,7 @@ class WsApp(App):
 
     def refresh_texts(self):
         text_list = self.query_one('#texts')
-        values = [(x, x) for x in self.state.get_value('texts').keys()]
+        values = [(x, x) for x in sorted(self.state.get_value('texts').keys())]
         text_list.set_options(values)
         text_list.value = self.state.get_value('text_selected', values[0][0])
 
@@ -1092,6 +1173,7 @@ class WsApp(App):
 
             self.state.get_value('configurations')[val.input1]['filename'] = val.input2
 
+        self.state.configuration_name = val.input1
         self.refresh_configurations()
 
     @work
@@ -1144,7 +1226,7 @@ class WsApp(App):
 
     def refresh_configurations(self):
         config_list = self.query_one('#configurations_list')
-        config_list.set_options([(x, x) for x in self.state.configurations.keys()])
+        config_list.set_options([(x, x) for x in sorted(self.state.configurations.keys())])
         config_list.value = self.state.configuration_name
 
     def on_mount(self):
@@ -1155,7 +1237,6 @@ class WsApp(App):
 
     @on(Button.Pressed, '#connect')
     async def on_connect_button_message(self, message: Message):
-        log = self.query_one('#ws_sessions_log')
         addr = self.query_one(AddressInput).value
 
         if self.state.get_value('template_url'):
@@ -1183,7 +1264,7 @@ class WsApp(App):
             'follow_redirects': self.state.get_value('follow_redirects')
         }
 
-        log.write(f'Connecting to: {addr}')
+        self.log_field.write(f'Connecting to: {addr}')
 
         self._connect_task = asyncio.create_task(self.connect())
 
@@ -1209,31 +1290,6 @@ class WsApp(App):
 
         if self.state.get_value('method') != 'WS':
             self.query_one('#connect').action_press()
-
-    async def get_key_value_from_modal(
-        self,
-        title: str,
-        name: str = None,
-        value: str = None,
-        input1_placeholder = 'Name',
-        input2_placeholder = 'Value'
-    ) -> str:
-        screen = DoubleInputModalScreen(
-            title,
-            name=name,
-            value=value,
-            input1_placeholder=input1_placeholder,
-            input2_placeholder=input2_placeholder
-        )
-
-        data = await self.push_screen_wait(
-            screen
-        )
-
-        if not data:
-            return (None, None)
-
-        return (data[0], data[1])
 
     async def edit_config_state_config_key(
             self,
@@ -1271,8 +1327,8 @@ class WsApp(App):
         self.state.get_value(section)[data.input1] = self.state.get_value(section).pop(orig_key_name)
         return data
 
-    async def confirm_request(self, title: str) -> bool:
-        screen = ConfirmScreen(title)
+    async def confirm_request(self, title: str, with_no_button=None) -> bool:
+        screen = ConfirmScreen(title, with_no_button=with_no_button)
 
         data = await self.push_screen_wait(
             screen
@@ -1311,10 +1367,10 @@ class WsApp(App):
             val.input1 in self.state.get_value(section)
         ):
             # unable to rename as record already exists
-            return (None, None)
+            return val
 
         self.state.get_value(section).pop(orig_key_name)
-        self.state.get_value(section)[val.input1] = value
+        self.state.get_value(section)[val.input1] = val.input2
         return val
 
     @on(Button.Pressed, '#ping')
@@ -1411,19 +1467,24 @@ class WsApp(App):
             self.refresh_fields()
 
     def compose_request_tab(self):
+        self.status_label = Label('Disconnected', id='status')
+        self.log_field = WsRichLog(highlight=True, markup=True, id='ws_sessions_log')
+
         yield MainGrid(
             ConnectContainer(
                 AddressInput(self.state.get_value('url'), placeholder='URL', id='address'),
-                Select([(x, x) for x in HTTP_METHODS], id='method', prompt='Method', value='WS', allow_blank=False),
+                SelectSearchable(
+                    [(x, x) for x in HTTP_METHODS], id='method', prompt='Method', value='WS', allow_blank=False
+                ),
                 Button('Connect', id='connect')
             ),
             Horizontal(
-                Label('Disconnected', id='status'),
+                self.status_label,
                 LogStatus('', id='log_status'),
             ),
-            WsRichLog(highlight=True, markup=True, id='ws_sessions_log'),
+            self.log_field,
             HorizontalHAuto(
-                Select([('', '')], id='texts', prompt='Text', allow_blank=False),
+                SelectSearchable([('', '')], id='texts', prompt='Text', allow_blank=False),
                 NarrowButton('Add', id='add_text'),
                 NarrowButton('Delete', id='delete_text'),
                 NarrowButton('Edit', id='edit_text')
@@ -1478,7 +1539,7 @@ class WsApp(App):
             ),
             Label('Configurations'),
             HorizontalHAuto(
-                Select([('', '')], id='configurations_list', prompt='Configuration', allow_blank=False),
+                SelectSearchable([('', '')], id='configurations_list', prompt='Configuration', allow_blank=False),
                 NarrowButton('Add', id='add_configuration'),
                 NarrowButton('Delete', id='delete_configuration'),
                 NarrowButton('Edit', id='edit_configuration'),
@@ -1486,7 +1547,7 @@ class WsApp(App):
             ),
             Label('Contexts'),
             HorizontalHAuto(
-                Select([('', '')], id='contexts_list', prompt='Context', allow_blank=False),
+                SelectSearchable([('', '')], id='contexts_list', prompt='Context', allow_blank=False),
                 NarrowButton('Add', id='add_context'),
                 NarrowButton('Delete', id='delete_context'),
                 NarrowButton('Edit', id='edit_context'),
@@ -1508,7 +1569,7 @@ class WsApp(App):
         )
 
     def set_status_text(self, text: str):
-        self.query_one('#status').update(text)
+        self.status_label.update(text)
 
     def compose(self) -> ComposeResult:
         with TabbedContent(initial='Request'):
@@ -1521,16 +1582,13 @@ class WsApp(App):
 
 
 def main():
-    try:
-        parser = argparse.ArgumentParser()
-        parser.add_argument('--config', '-c', dest='config_path', default=None)
-        args = parser.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', '-c', dest='config_path', default=None)
+    args = parser.parse_args()
 
-        state = State(args.config_path)
-        app = WsApp(state)
-        app.run()
-    finally:
-        state.save()
+    state = State(args.config_path)
+    app = WsApp(state)
+    app.run()
 
 
 if __name__ == '__main__':
