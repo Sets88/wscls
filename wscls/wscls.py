@@ -1389,10 +1389,6 @@ class WsApp(App):
 
     @on(Switch.Changed, '#stick_url_to_text')
     def stick_url_to_text_switch(self, message: Message):
-        if message.value:
-            for text in self.state.get_value('texts').values():
-                text['url'] = self.state.get_value('url')
-                text['method'] = self.state.get_value('method')
         self.state.set_value('stick_url_to_text', message.value)
 
     @on(Switch.Changed, '#follow_redirects')
