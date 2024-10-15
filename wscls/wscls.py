@@ -39,6 +39,7 @@ from textual.containers import ScrollableContainer
 from textual.screen import ModalScreen
 from textual import on
 from textual import work
+import pyperclip
 
 
 HTTP_METHODS = [
@@ -124,10 +125,8 @@ class SelectSearchable(Select):
         if self._search_str == self.value:
             self._search_str = ''
 
-        if event.key == 'space':
-            self._search_str += ' '
-        elif event.is_printable:
-            self._search_str += event.key
+        if event.is_printable:
+            self._search_str += event.character
         elif event.key == 'backspace':
             self._search_str = self._search_str[:-1]
         else:
@@ -349,7 +348,7 @@ class State:
                             continue
 
                     with tempfile.NamedTemporaryFile(mode="w", buffering=1) as fil:
-                        fil.write(json.dumps(config_to_save))
+                        fil.write(json.dumps(config_to_save, indent=2))
                         fil.flush()
 
                         shutil.copy(fil.name, config['filename'])
@@ -391,6 +390,25 @@ class WsRichLog(RichLog):
         Binding('c', 'clear', 'Clear log'),
         Binding('w', 'toggle_wrap', 'Toggle word wrap'),
     ]
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._last_click_ts = None
+
+    def on_click(self, event: Event):
+        """Double click - copy to clipboard"""
+        if self._last_click_ts is None:
+            self._last_click_ts = time()
+            return
+
+        if time() - self._last_click_ts > 0.5:
+            self._last_click_ts = time()
+            return
+
+        for line in self.lines[int(self.scroll_y) + event.y-1:]:
+            pyperclip.copy(line.text)
+            self.app.notify(f'Copied to clipboard', title='Copied', severity='info')
+            break
 
     def action_toggle_wrap(self):
         self.wrap = not self.wrap
@@ -670,28 +688,28 @@ class WsApp(App):
         if save_result:
             self.exit()
 
-    async def process_incomming_ws_message(self, log: RichLog, msg: WSMessage):
+    async def process_incomming_ws_message(self, msg: WSMessage):
         if msg.type == aiohttp.WSMsgType.ERROR:
             self.log_field.write('[red]Error: ')
         elif msg.type == aiohttp.WSMsgType.PONG:
             rtt = round((time() - float(msg.data.decode('utf-8'))) * 1000, 3)
             self.log_field.write(f'[cyan]Pong received, RTT: {rtt} ms')
         else:
-            self.log_field.write(f'[cyan]Received: {msg.data}')
+            self.log_field.write(f'[cyan]Received:\n{msg.data}')
 
-    def on_connected(self, log: RichLog, url: str):
+    def on_connected(self, url: str):
         text = f'[green]Connected to: {url}'
-        log.write(text)
+        self.log_field.write(text)
         self.set_status_text(text)
-        log.styles.border = ('heavy', 'green')
+        self.log_field.styles.border = ('heavy', 'green')
 
-    def on_disconnected(self, log: RichLog):
+    def on_disconnected(self):
         text = '[red]Disconnected'
         self.set_status_text(text)
-        log.write(text)
-        log.styles.border = ('heavy', 'red')
+        self.log_field.write(text)
+        self.log_field.styles.border = ('heavy', 'red')
 
-    async def connect_ws(self, session: aiohttp.ClientSession, log: RichLog):
+    async def connect_ws(self, session: aiohttp.ClientSession):
         ssl_check = None if self._connecting_params['ssl_check'] else False
         url = self._connecting_params['url']
         headers = self._connecting_params['headers']
@@ -705,17 +723,18 @@ class WsApp(App):
         ) as ws:
             try:
                 self._ws = ws
-                self.on_connected(log, url)
+                self.on_connected(url)
                 async for msg in ws:
-                    await self.process_incomming_ws_message(log, msg)
+                    await self.process_incomming_ws_message(msg)
 
-                log.write(f'[red]Closed by remote side with code: {ws.close_code}')
+                self.log_field.write(f'[red]Closed by remote side with code: {ws.close_code}')
             except Exception as exc:
-                log.write(f'[red]Error: {exc}')
+                self.log_field.write(f'[red]Error: {exc}')
             finally:
-                self.on_disconnected(log)
+                self.on_disconnected()
 
-    async def connect_http(self, session: aiohttp.ClientSession, log: RichLog):
+    async def connect_http(self, session: aiohttp.ClientSession):
+        self.log_field.styles.border = ('heavy', 'black')
         url = self._connecting_params['url']
         method = self._connecting_params['method']
         headers = self._connecting_params['headers']
@@ -740,12 +759,12 @@ class WsApp(App):
             data=text,
             allow_redirects=follow_redirects
         ) as resp:
-            log.write(f'[cyan]Request: {method} {url}')
-            log.write(f'[cyan]Response: {resp.status}')
+            self.log_field.write(f'[cyan]Request: {method} {url}')
+            self.log_field.write(f'[cyan]Response: {resp.status}')
             if self.state.get_value('show_headers'):
                 headers_text = ('\n   ').join([f"{key}: {value}" for key, value in resp.headers.items()])
-                log.write(f'[cyan]Headers:\n   {headers_text}')
-            log.write(f'[cyan]Body: \n{await resp.text()}')
+                self.log_field.write(f'[cyan]Headers:\n   {headers_text}')
+            self.log_field.write(f'[cyan]Body: \n{await resp.text()}')
 
     async def connect(self):
         while True:
@@ -755,9 +774,9 @@ class WsApp(App):
             try:
                 async with aiohttp.ClientSession(raise_for_status=True) as session:
                     if self._connecting_params['method'] == 'WS':
-                        await self.connect_ws(session, self.log_field)
+                        await self.connect_ws(session)
                     else:
-                        await self.connect_http(session, self.log_field)
+                        await self.connect_http(session)
             except Exception as exc:
                 self.log_field.write(f'[red]Error: {exc}')
 
@@ -790,6 +809,7 @@ class WsApp(App):
         self.query_one('#auto_reconnect').value = self.state.get_value('auto_reconnect')
         self.query_one('#ssl_check').value = self.state.get_value('ssl_check')
         self.query_one('#template_url').value = self.state.get_value('template_url')
+        self.query_one('#template_headers').value = self.state.get_value('template_headers')
         self.query_one('#template_data').value = self.state.get_value('template_data')
         self.refresh_headers()
         self.refresh_globals()
@@ -1107,6 +1127,25 @@ class WsApp(App):
 
         self.refresh_texts()
 
+    @on(Button.Pressed, '#copy_curl')
+    async def copy_curl(self, message: Message):
+        params = self.get_connect_params()
+
+        if params['method'] == 'WS':
+            return
+
+        curl_template = 'curl -X {method} {url} {headers} {data}'
+
+        curl = curl_template.format(
+            method=params['method'],
+            url=params['url'],
+            headers=' '.join([f'-H "{k}: {v}"' for k, v in params['headers'].items()]),
+            data=self.state.get_current_text()['text']
+        )
+
+        pyperclip.copy(curl)
+        self.app.notify(f'Copied to clipboard', title='Copied', severity='info')
+
     def refresh_texts(self):
         text_list = self.query_one('#texts')
         values = [(x, x) for x in sorted(self.state.get_value('texts').keys())]
@@ -1235,12 +1274,32 @@ class WsApp(App):
         self.refresh_configurations()
         self.refresh_texts()
 
-    @on(Button.Pressed, '#connect')
-    async def on_connect_button_message(self, message: Message):
+    def get_connect_params(self):
         addr = self.query_one(AddressInput).value
 
         if self.state.get_value('template_url'):
             addr = render_template(addr, self.state.get_variables())
+
+        headers = {}
+
+        for key, value in self.state.get_value('headers').items():
+            if self.state.get_value('template_headers'):
+                key = render_template(key, self.state.get_variables())
+                value = render_template(value, self.state.get_variables())
+
+            headers[key] = value
+
+        return {
+            'url': addr,
+            'headers': headers,
+            'autoping': self.state.get_value('autoping'),
+            'ssl_check': self.state.get_value('ssl_check'),
+            'method': self.state.get_value('method', 'WS'),
+            'follow_redirects': self.state.get_value('follow_redirects')
+        }
+
+    @on(Button.Pressed, '#connect')
+    async def on_connect_button_message(self, message: Message):
 
         if self._connect_task:
             button = self.query_one('#connect')
@@ -1255,16 +1314,9 @@ class WsApp(App):
 
         button = self.query_one('#connect')
         button.label = 'Disconnect'
-        self._connecting_params = {
-            'url': addr,
-            'headers': self.state.get_value('headers'),
-            'autoping': self.state.get_value('autoping'),
-            'ssl_check': self.state.get_value('ssl_check'),
-            'method': self.state.get_value('method', 'WS'),
-            'follow_redirects': self.state.get_value('follow_redirects')
-        }
+        self._connecting_params = self.get_connect_params()
 
-        self.log_field.write(f'Connecting to: {addr}')
+        self.log_field.write(f'Connecting to: {self._connecting_params["url"]}')
 
         self._connect_task = asyncio.create_task(self.connect())
 
@@ -1284,7 +1336,7 @@ class WsApp(App):
                     text = render_template(text, self.state.get_variables())
 
                 await self._ws.send_str(text)
-                log.write(f'[yellow]Sent: {text}')
+                log.write(f'[yellow]Sent:\n{text}')
             except Exception as exc:
                 log.write(f'[red]Error: {exc}')
 
@@ -1418,6 +1470,10 @@ class WsApp(App):
     def template_url_switch(self, message: Message):
         self.state.set_value('template_url', message.value)
 
+    @on(Switch.Changed, '#template_headers')
+    def template_headers_switch(self, message: Message):
+        self.state.set_value('template_headers', message.value)
+
     @on(Switch.Changed, '#template_data')
     def template_data_switch(self, message: Message):
         self.state.set_value('template_data', message.value)
@@ -1465,6 +1521,7 @@ class WsApp(App):
     def compose_request_tab(self):
         self.status_label = Label('Disconnected', id='status')
         self.log_field = WsRichLog(highlight=True, markup=True, id='ws_sessions_log')
+        self.log_field.styles.border = ('heavy', 'black')
 
         yield MainGrid(
             ConnectContainer(
@@ -1483,7 +1540,8 @@ class WsApp(App):
                 SelectSearchable([('', '')], id='texts', prompt='Text', allow_blank=False),
                 NarrowButton('Add', id='add_text'),
                 NarrowButton('Delete', id='delete_text'),
-                NarrowButton('Edit', id='edit_text')
+                NarrowButton('Edit', id='edit_text'),
+                NarrowButton('Copy Curl', id='copy_curl')
             ),
             SendTextArea(''),
             HorizontalHAuto(
@@ -1526,8 +1584,12 @@ class WsApp(App):
                 Switch(self.state.get_value('ssl_check'), animate=True, id='ssl_check')
             ),
             SwitchContainer(
-                Label('\nUse Temlate for the url:'),
+                Label('\nUse Template for the url:'),
                 Switch(self.state.get_value('template_url'), animate=True, id='template_url')
+            ),
+            SwitchContainer(
+                Label('\nUse Template for headers:'),
+                Switch(self.state.get_value('template_headers'), animate=True, id='template_headers')
             ),
             SwitchContainer(
                 Label('\nUse templates for the data being sent.:'),
