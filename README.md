@@ -78,3 +78,4 @@ when focus is on the log area:
 - c - Clear log
 - w - Toggle word wrap
 - s - Toggle auto-scrolling
+- mouse double click - Copy line to clipboard
