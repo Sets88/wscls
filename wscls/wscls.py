@@ -116,6 +116,31 @@ def render_template(template: str, variables: dict) -> str:
     return Template(template).safe_substitute(variables)
 
 
+class WidgetImprovements(Widget):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._last_click_ts = None
+
+    def on_click(self, event: Event):
+        """Double click - copy to clipboard"""
+
+        if hasattr(super(), 'on_click'):
+            super().on_click(event)
+
+        if self._last_click_ts is None:
+            self._last_click_ts = time()
+            return
+
+        if time() - self._last_click_ts > 0.5:
+            self._last_click_ts = time()
+            return
+
+        self.on_double_click(event)
+
+    def on_double_click(self, event: Event):
+        pass
+
+
 class SelectSearchable(Select):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -384,27 +409,14 @@ class State:
         return True
 
 
-class WsRichLog(RichLog):
+class WsRichLog(RichLog, WidgetImprovements):
     BINDINGS = [
         Binding('s', 'toggle_scroll', 'Toggle auto scroll'),
         Binding('c', 'clear', 'Clear log'),
         Binding('w', 'toggle_wrap', 'Toggle word wrap'),
     ]
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self._last_click_ts = None
-
-    def on_click(self, event: Event):
-        """Double click - copy to clipboard"""
-        if self._last_click_ts is None:
-            self._last_click_ts = time()
-            return
-
-        if time() - self._last_click_ts > 0.5:
-            self._last_click_ts = time()
-            return
-
+    def on_double_click(self, event: Event):
         for line in self.lines[int(self.scroll_y) + event.y-1:]:
             pyperclip.copy(line.text)
             self.app.notify(f'Copied to clipboard', title='Copied', severity='info')
@@ -642,8 +654,10 @@ class ConfirmScreen(ModalScreen):
                     yield Button('Cancel', id='cancel')
 
 
-class AddressInput(Input):
-    pass
+class AddressInput(Input, WidgetImprovements):
+    def on_double_click(self, event: Event):
+        pyperclip.copy(self.value)
+        self.app.notify(f'Copied to clipboard', title='Copied', severity='info')
 
 
 class LogStatus(Label):
@@ -660,13 +674,17 @@ class LogStatus(Label):
             f"[cyan]c[/cyan] Scroll: [cyan]s[/cyan] ( {'On ' if self.auto_scroll else 'Off'} )   ")
 
 
-class SendTextArea(TextArea):
+class SendTextArea(TextArea, WidgetImprovements):
     BINDINGS = [
         Binding('ctrl+r', 'send_message'),
         Binding('ctrl+f', 'send_message')
     ]
     def on_text_area_changed(self, event: Event):
         self.app.state.get_current_text()['text'] = self.text
+
+    def on_double_click(self, event: Event):
+        pyperclip.copy(self.text)
+        self.app.notify(f'Copied to clipboard', title='Copied', severity='info')
 
     async def action_send_message(self):
         self.app.query_one('#send_message').action_press()
